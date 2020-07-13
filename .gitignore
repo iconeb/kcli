@@ -16,3 +16,6 @@ prout.yml
 .cache/
 kvirt/static/reports/*
 venv*
+.project
+.pydevproject
+.settings/
