@@ -12,6 +12,7 @@ from kvirt.defaults import IMAGES, IMAGESCOMMANDS
 from kvirt import ansibleutils
 from kvirt import nameutils
 from kvirt import common
+from kvirt import k3s
 from kvirt import kubeadm
 from kvirt.expose import Kexposer
 from kvirt import openshift
@@ -1779,12 +1780,13 @@ $INFO
                     if self.type == 'vsphere':
                         shortname = image
                     clientprofile = "%s_%s" % (self.client, imagename)
-                    if clientprofile not in self.profiles:
-                        common.pprint("Adding a profile named %s with default values" % clientprofile)
-                        self.create_profile(clientprofile, {'image': shortname}, quiet=True)
-                    else:
-                        common.pprint("Updating profile %s with image %s" % (clientprofile, shortname))
-                        self.update_profile(clientprofile, {'image': shortname}, quiet=True)
+                    if not clientprofile.endswith('.iso'):
+                        if clientprofile not in self.profiles:
+                            common.pprint("Adding a profile named %s with default values" % clientprofile)
+                            self.create_profile(clientprofile, {'image': shortname}, quiet=True)
+                        else:
+                            common.pprint("Updating profile %s with image %s" % (clientprofile, shortname))
+                            self.update_profile(clientprofile, {'image': shortname}, quiet=True)
             return {'result': 'success'}
         elif switch:
             if switch not in self.clients:
@@ -1930,6 +1932,14 @@ $INFO
         plandir = os.path.dirname(kubeadm.create.__code__.co_filename)
         kubeadm.create(self, plandir, cluster, overrides)
 
+    def create_kube_k3s(self, cluster, overrides={}):
+        if os.path.exists('/i_am_a_container'):
+            os.environ['PATH'] += ':/workdir'
+        else:
+            os.environ['PATH'] += ':.'
+        plandir = os.path.dirname(k3s.create.__code__.co_filename)
+        k3s.create(self, plandir, cluster, overrides)
+
     def create_kube_openshift(self, cluster, overrides={}):
         if os.path.exists('/i_am_a_container'):
             os.environ['PATH'] += ':/workdir'
@@ -1948,6 +1958,10 @@ $INFO
     def scale_kube_generic(self, cluster, overrides={}):
         plandir = os.path.dirname(kubeadm.create.__code__.co_filename)
         kubeadm.scale(self, plandir, cluster, overrides)
+
+    def scale_kube_k3s(self, cluster, overrides={}):
+        plandir = os.path.dirname(k3s.create.__code__.co_filename)
+        k3s.scale(self, plandir, cluster, overrides)
 
     def scale_kube_openshift(self, cluster, overrides={}):
         plandir = os.path.dirname(openshift.create.__code__.co_filename)
