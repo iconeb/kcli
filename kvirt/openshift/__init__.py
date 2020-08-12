@@ -7,10 +7,11 @@ import json
 import os
 import sys
 from kvirt.common import info, pprint, gen_mac, get_oc, get_values, pwd_path, insecure_fetch, fetch
+from kvirt.common import get_commit_rhcos, get_latest_fcos
 from kvirt.openshift.calico import calicoassets
 from random import randint
 import re
-from shutil import copy2, move, rmtree
+from shutil import copy2, rmtree
 from subprocess import call
 from time import sleep
 from urllib.request import urlopen
@@ -18,6 +19,14 @@ from urllib.request import urlopen
 
 virtplatforms = ['kvm', 'kubevirt', 'ovirt', 'openstack', 'vsphere', 'packet']
 cloudplatforms = ['aws', 'gcp']
+DEFAULT_TAG = '4.5'
+
+
+def get_installer_version():
+    INSTALLER_VERSION = os.popen('openshift-install version').readlines()[0].split(" ")[1].strip()
+    if INSTALLER_VERSION.startswith('v'):
+        INSTALLER_VERSION = INSTALLER_VERSION[1:]
+    return INSTALLER_VERSION
 
 
 def get_rhcos_openstack_url():
@@ -193,8 +202,7 @@ def create(config, plandir, cluster, overrides):
             'network': 'default',
             'masters': 1,
             'workers': 0,
-            'cloud_tag': 'cnvlab',
-            'tag': '4.5',
+            'tag': DEFAULT_TAG,
             'ipv6': False,
             'pub_key': '%s/.ssh/id_rsa.pub' % os.environ['HOME'],
             'pull_secret': 'openshift_pull.json',
@@ -216,10 +224,12 @@ def create(config, plandir, cluster, overrides):
     ipv6 = data['ipv6']
     upstream = data.get('upstream')
     version = data.get('version')
+    tag = data.get('tag')
+    if os.path.exists('openshift-install'):
+        pprint("Removing old openshift-install", color='blue')
+        os.remove('openshift-install')
     baremetal = data.get('baremetal')
     minimal = data.get('minimal')
-    user_agent = "User-Agent: Ignition/2.3.0" if upstream else "User-Agent: Ignition/0.35.0"
-    overrides['user_agent'] = user_agent
     if version not in ['ci', 'nightly']:
         pprint("Using stable version", color='blue')
     else:
@@ -231,7 +241,7 @@ def create(config, plandir, cluster, overrides):
     if platform in virtplatforms and api_ip is None:
         if network == 'default' and platform == 'kvm':
             pprint("Using 192.168.122.253 as api_ip", color='yellow')
-            data['api_ip'] = "192.168.122.253"
+            overrides['api_ip'] = "192.168.122.253"
             api_ip = "192.168.122.253"
         else:
             pprint("You need to define api_ip in your parameters file", color='red')
@@ -316,44 +326,44 @@ def create(config, plandir, cluster, overrides):
             get_upstream_installer(tag=tag)
         else:
             get_downstream_installer(tag=tag)
-        if not macosx and os.path.exists('/i_am_a_container'):
-            move('openshift-install', '/workdir')
-    INSTALLER_VERSION = os.popen('openshift-install version').readlines()[0].split(" ")[1].strip()
-    if INSTALLER_VERSION.startswith('v'):
-        INSTALLER_VERSION = INSTALLER_VERSION[1:]
+        pprint("Move downloaded openshift-install somewhere in your path if you want to reuse it", color='blue')
+    INSTALLER_VERSION = get_installer_version()
+    COMMIT_ID = os.popen('openshift-install version').readlines()[1].replace('built from commit', '').strip()
     if platform == 'packet' and not upstream:
-        COMMIT_ID = os.popen('openshift-install version').readlines()[1].replace('built from commit', '').strip()
         overrides['commit_id'] = COMMIT_ID
     pprint("Using installer version %s" % INSTALLER_VERSION, color='blue')
+    OPENSHIFT_VERSION = INSTALLER_VERSION[0:3].replace('.', '')
+    curl_header = "Accept: application/vnd.coreos.ignition+json; version=3.1.0"
     if upstream:
-        COS_VERSION = ""
-        COS_TYPE = "fedora-coreos"
-    else:
-        COS_TYPE = "rhcos"
-        version_match = re.match("4.([0-9]*).*", INSTALLER_VERSION)
-        COS_VERSION = "4%s" % version_match.group(1) if version_match is not None else '45'
+        curl_header = "User-Agent: Ignition/2.3.0"
+    elif OPENSHIFT_VERSION.isdigit() and int(OPENSHIFT_VERSION) < 46:
+        curl_header = "User-Agent: Ignition/0.35.0"
+    overrides['curl_header'] = curl_header
     if image is None:
-        if platform == 'packet':
-            pprint("Missing image in your parameters file. This is required for packet", color='red')
-            os._exit(1)
-        images = [v for v in k.volumes() if COS_TYPE in v and COS_VERSION in v]
-        if images:
-            image = os.path.basename(images[0])
+        if upstream:
+            fcos_base = 'stable' if version == 'stable' else 'testing'
+            fcos_url = "https://builds.coreos.fedoraproject.org/streams/%s.json" % fcos_base
+            image_url = get_latest_fcos(fcos_url, _type=config.type)
         else:
-            pprint("Downloading %s image" % COS_TYPE, color='blue')
-            result = config.handle_host(pool=config.pool, image="%s%s" % (COS_TYPE, COS_VERSION),
-                                        download=True, update_profile=False)
+            image_url = get_commit_rhcos(COMMIT_ID, _type=config.type)
+        image = os.path.basename(os.path.splitext(image_url)[0])
+        images = [v for v in k.volumes() if image in v]
+        if not images:
+            result = config.handle_host(pool=config.pool, image=image, download=True, update_profile=False,
+                                        url=image_url)
             if result['result'] != 'success':
                 os._exit(1)
-            images = [v for v in k.volumes() if "%s-%s" % (COS_TYPE, COS_VERSION) in v]
-            image = images[0]
-        pprint("Using image %s" % image, color='blue')
+        else:
+            pprint("Using image %s" % image, color='blue')
     elif platform != 'packet':
         pprint("Checking if image %s is available" % image, color='blue')
         images = [v for v in k.volumes() if image in v]
         if not images:
             pprint("Missing %s. Indicate correct image in your parameters file..." % image, color='red')
             os._exit(1)
+    else:
+        pprint("Missing image in your parameters file. This is required for packet", color='red')
+        os._exit(1)
     overrides['image'] = image
     overrides['cluster'] = cluster
     if not os.path.exists(clusterdir):
@@ -551,8 +561,11 @@ def create(config, plandir, cluster, overrides):
         sedcmd += '%s/master.ign' % clusterdir
         sedcmd += ' > %s/bootstrap.ign' % clusterdir
         call(sedcmd, shell=True)
-    if masters == 1 and (upstream or int(COS_VERSION) > 43):
-        overrides['fix_ceo'] = True
+    if masters == 1:
+        version_match = re.match("4.([0-9]*).*", INSTALLER_VERSION)
+        COS_VERSION = "4%s" % version_match.group(1) if version_match is not None else '45'
+        if upstream or int(COS_VERSION) > 43:
+            overrides['fix_ceo'] = True
     if platform in virtplatforms:
         if disconnected_deploy:
             disconnected_vm = "%s-disconnecter" % cluster
@@ -581,7 +594,9 @@ def create(config, plandir, cluster, overrides):
                 except Exception as e:
                     pprint("Hit %s. Continuing still" % str(e), color='red')
                     continue
-        run = call('openshift-install --dir=%s wait-for bootstrap-complete' % clusterdir, shell=True)
+        bootstrapcommand = 'openshift-install --dir=%s wait-for bootstrap-complete' % clusterdir
+        bootstrapcommand += ' || %s' % bootstrapcommand
+        run = call(bootstrapcommand, shell=True)
         if run != 0:
             pprint("Leaving environment for debugging purposes", color='red')
             pprint("You can delete it with kcli delete kube --yes %s" % cluster, color='red')
@@ -596,21 +611,17 @@ def create(config, plandir, cluster, overrides):
         call('openshift-install --dir=%s wait-for bootstrap-complete || exit 1' % clusterdir, shell=True)
         todelete = ["%s-bootstrap" % cluster, "%s-bootstrap-helper" % cluster]
     if platform in virtplatforms:
-        wait_time = 90 if masters > 1 else 180
-        pprint("Waiting %ss before retrieving workers ignition data" % wait_time, color='blue')
-        sleep(wait_time)
-    call("oc adm taint nodes -l node-role.kubernetes.io/master node-role.kubernetes.io/master:NoSchedule-", shell=True)
-    pprint("Deploying certs autoapprover cronjob", color='blue')
-    call("oc create -f %s/autoapprovercron.yml" % clusterdir, shell=True)
-    if platform in virtplatforms:
         ignitionworkerfile = "%s/worker.ign" % clusterdir
         os.remove(ignitionworkerfile)
         while not os.path.exists(ignitionworkerfile) or os.stat(ignitionworkerfile).st_size == 0:
-            with open(ignitionworkerfile, 'w') as w:
-                workerdata = insecure_fetch("https://api.%s.%s:22623/config/worker" % (cluster, domain),
-                                            headers=[user_agent])
-                w.write(workerdata)
-            sleep(5)
+            try:
+                with open(ignitionworkerfile, 'w') as w:
+                    workerdata = insecure_fetch("https://api.%s.%s:22623/config/worker" % (cluster, domain),
+                                                headers=[curl_header])
+                    w.write(workerdata)
+            except:
+                pprint("Waiting 5s before retrieving workers ignition data", color='blue')
+                sleep(5)
         if workers > 0:
             pprint("Deploying workers", color='blue')
             if 'name' in overrides:
@@ -625,10 +636,13 @@ def create(config, plandir, cluster, overrides):
                 allnodes = ["%s-worker-%s" % (cluster, num) for num in range(workers)]
                 for node in allnodes:
                     k.add_nic(node, network)
+    call("oc adm taint nodes -l node-role.kubernetes.io/master node-role.kubernetes.io/master:NoSchedule-", shell=True)
+    pprint("Deploying certs autoapprover cronjob", color='blue')
+    call("oc create -f %s/autoapprovercron.yml" % clusterdir, shell=True)
     if not minimal:
         installcommand = 'openshift-install --dir=%s wait-for install-complete' % clusterdir
-        installcommand = "%s | %s" % (installcommand, installcommand)
-        pprint("Launching install-complete step. Note it will be retried one extra time in case of timeouts",
+        installcommand += " || %s" % installcommand
+        pprint("Launching install-complete step. It will be retried one extra time in case of timeouts",
                color='blue')
         call(installcommand, shell=True)
     else:

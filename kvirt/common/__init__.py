@@ -12,6 +12,7 @@ from jinja2.exceptions import TemplateSyntaxError, TemplateError
 from distutils.spawn import find_executable
 from netaddr import IPAddress
 import random
+import re
 import socket
 import ssl
 from urllib.parse import quote
@@ -334,12 +335,12 @@ def process_files(files=[], overrides={}):
                     pprint("Error rendering file %s. Got: %s" % (origin, e.message), color='red')
                     os._exit(1)
                 content = [line.rstrip() for line in fileentries.split('\n')]
-                with open("/tmp/%s" % os.path.basename(path), 'w') as f:
-                    for line in fileentries.split('\n'):
-                        if line.rstrip() == '':
-                            f.write("\n")
-                        else:
-                            f.write("%s\n" % line.rstrip())
+                # with open("/tmp/%s" % os.path.basename(path), 'w') as f:
+                #     for line in fileentries.split('\n'):
+                #         if line.rstrip() == '':
+                #             f.write("\n")
+                #         else:
+                #             f.write("%s\n" % line.rstrip())
             else:
                 content = [line.rstrip() for line in open(origin, 'r').readlines()]
         data += "- owner: %s:%s\n" % (owner, owner)
@@ -1173,6 +1174,17 @@ def get_latest_rhcos(url, _type='kvm'):
                         return "%s/%s/%s" % (url, build, data['images'][key]['path'])
 
 
+def get_commit_rhcos(commitid, _type='kvm'):
+    keys = {'ovirt': 'openstack', 'kvm': 'qemu', 'vsphere': 'vmware'}
+    key = keys.get(_type, _type)
+    buildurl = "https://raw.githubusercontent.com/openshift/installer/%s/data/data/rhcos.json" % commitid
+    with urlopen(buildurl) as b:
+        data = json.loads(b.read().decode())
+        baseuri = data['baseURI']
+        path = "%s%s" % (baseuri, data['images'][key]['path'])
+        return path
+
+
 def get_commit_rhcos_metal(commitid):
     buildurl = "https://raw.githubusercontent.com/openshift/installer/%s/data/data/rhcos.json" % commitid
     with urlopen(buildurl) as b:
@@ -1413,8 +1425,9 @@ def insecure_fetch(url, headers=[]):
     req = Request(url)
     if headers:
         for header in headers:
-            key, value = header.split(' ')
-            key = key.replace(':', '')
+            header_split = header.split(' ')
+            key = header_split[0].replace(':', '')
+            value = ' '.join(header_split[1:])
             req.add_header(key, value)
     response = urlopen(req, timeout=5, context=context)
     data = response.read()
@@ -1455,6 +1468,10 @@ def ignition_version(image):
         version = '3.0.0'
     else:
         version = '2.2.0'
+        image = os.path.basename(image)
+        version_match = re.match('rhcos-*(..).*', image)
+        if version_match is not None and int(version_match.group(1)) >= 46:
+            version = '3.0.0'
     return version
 
 

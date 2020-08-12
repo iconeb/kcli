@@ -29,12 +29,13 @@ def cache_vms(baseconfig, region, zone, namespace):
     if os.path.exists(cache_file):
         with open(cache_file, 'r') as vms:
             _list = yaml.safe_load(vms)
+        common.pprint("Using cache information...", color='blue')
     else:
         config = Kconfig(client=baseconfig.client, debug=baseconfig.debug, region=region, zone=zone,
                          namespace=namespace)
         _list = config.k.list()
         with open(cache_file, 'w') as c:
-            common.pprint("Caching results for %s..." % baseconfig.client)
+            common.pprint("Caching results for %s..." % baseconfig.client, color='blue')
             try:
                 yaml.safe_dump(_list, c, default_flow_style=False, encoding='utf-8', allow_unicode=True,
                                sort_keys=False)
@@ -449,7 +450,7 @@ def list_vm(args):
     if args.client is not None and ',' in args.client:
         vms = PrettyTable(["Name", "Host", "Status", "Ips", "Source", "Plan", "Profile"])
         for client in args.client.split(','):
-            config = Kbaseconfig(client=client, debug=args.debug)
+            config = Kbaseconfig(client=client, debug=args.debug, quiet=True)
             if config.cache:
                 _list = cache_vms(config, args.region, args.zone, args.namespace)
             else:
@@ -472,7 +473,7 @@ def list_vm(args):
         print(vms)
     else:
         vms = PrettyTable(["Name", "Status", "Ips", "Source", "Plan", "Profile"])
-        baseconfig = Kbaseconfig(client=args.client, debug=args.debug)
+        baseconfig = Kbaseconfig(client=args.client, debug=args.debug, quiet=True)
         if baseconfig.cache:
             _list = cache_vms(baseconfig, args.region, args.zone, args.namespace)
         else:
@@ -1533,6 +1534,25 @@ def download_openshift_installer(args):
     return 0
 
 
+def download_okd_installer(args):
+    """Download Okd Installer"""
+    paramfile = args.paramfile
+    if os.path.exists("/i_am_a_container"):
+        if paramfile is not None:
+            paramfile = "/workdir/%s" % paramfile
+        elif os.path.exists("/workdir/kcli_parameters.yml"):
+            paramfile = "/workdir/kcli_parameters.yml"
+            common.pprint("Using default parameter file kcli_parameters.yml")
+    elif paramfile is None and os.path.exists("kcli_parameters.yml"):
+        paramfile = "kcli_parameters.yml"
+        common.pprint("Using default parameter file kcli_parameters.yml")
+    overrides = common.get_overrides(paramfile=paramfile, param=args.param)
+    config = Kconfig(client=args.client, debug=args.debug, region=args.region, zone=args.zone, namespace=args.namespace)
+    overrides['upstream'] = True
+    config.download_openshift_installer(overrides)
+    return 0
+
+
 def create_pipeline(args):
     """Create Pipeline"""
     inputfile = args.inputfile
@@ -1708,13 +1728,14 @@ def ssh_vm(args):
             vm = vms[0]
             ip = vm.get('ip')
             if ip is None:
-                common.pprint("No ip found in cache for %s" % name, color='red')
-            if user is None:
-                user = vm.get('user')
-            vmport = vm.get('vmport')
-            sshcommand = common.ssh(name, ip=ip, user=user, local=l, remote=r, tunnel=tunnel,
-                                    tunnelhost=tunnelhost, tunnelport=tunnelport, tunneluser=tunneluser,
-                                    insecure=insecure, cmd=cmd, X=X, Y=Y, D=D, debug=args.debug, vmport=vmport)
+                common.pprint("No ip found in cache for %s..." % name, color='red')
+            else:
+                if user is None:
+                    user = vm.get('user')
+                vmport = vm.get('vmport')
+                sshcommand = common.ssh(name, ip=ip, user=user, local=l, remote=r, tunnel=tunnel,
+                                        tunnelhost=tunnelhost, tunnelport=tunnelport, tunneluser=tunneluser,
+                                        insecure=insecure, cmd=cmd, X=X, Y=Y, D=D, debug=args.debug, vmport=vmport)
     if sshcommand is None:
         config = Kconfig(client=args.client, debug=args.debug, region=args.region, zone=args.zone,
                          namespace=args.namespace)
@@ -1769,13 +1790,15 @@ def scp_vm(args):
             vm = vms[0]
             ip = vm.get('ip')
             if ip is None:
-                common.pprint("No ip found in cache for %s" % name, color='red')
-            if user is None:
-                user = vm.get('user')
-            vmport = vm.get('vmport')
-            scpcommand = common.scp(name, ip=ip, user=user, source=source, destination=destination, recursive=recursive,
-                                    tunnel=tunnel, tunnelhost=tunnelhost, tunnelport=tunnelport, tunneluser=tunneluser,
-                                    debug=args.debug, download=download, vmport=vmport, insecure=insecure)
+                common.pprint("No ip found in cache for %s..." % name, color='red')
+            else:
+                if user is None:
+                    user = vm.get('user')
+                vmport = vm.get('vmport')
+                scpcommand = common.scp(name, ip=ip, user=user, source=source, destination=destination,
+                                        recursive=recursive, tunnel=tunnel, tunnelhost=tunnelhost,
+                                        tunnelport=tunnelport, tunneluser=tunneluser, debug=args.debug,
+                                        download=download, vmport=vmport, insecure=insecure)
     if scpcommand is None:
         config = Kconfig(client=args.client, debug=args.debug, region=args.region, zone=args.zone,
                          namespace=args.namespace)
@@ -1818,16 +1841,14 @@ def delete_network(args):
     """Delete Network"""
     yes = args.yes
     yes_top = args.yes_top
-    name = args.name
+    names = args.names
     config = Kconfig(client=args.client, debug=args.debug, region=args.region, zone=args.zone, namespace=args.namespace)
     k = config.k
-    if name is None:
-        common.pprint("Missing Network", color='red')
-        os._exit(1)
     if not yes and not yes_top:
         common.confirm("Are you sure?")
-    result = k.delete_network(name=name)
-    common.handle_response(result, name, element='Network', action='deleted')
+    for name in names:
+        result = k.delete_network(name=name)
+        common.handle_response(result, name, element='Network', action='deleted')
 
 
 def create_host_kvm(args):
@@ -2242,7 +2263,7 @@ def cli():
                           epilog=version_epilog, formatter_class=argparse.RawDescriptionHelpFormatter)
 
     # sub subcommands
-    cachedelete_desc = 'Delete Container'
+    cachedelete_desc = 'Delete Cache'
     cachedelete_parser = delete_subparsers.add_parser('cache', description=cachedelete_desc, help=cachedelete_desc)
     cachedelete_parser.add_argument('-y', '--yes', action='store_true', help='Dont ask for confirmation')
     cachedelete_parser.set_defaults(func=delete_cache)
@@ -2689,7 +2710,7 @@ def cli():
     networkdelete_parser = delete_subparsers.add_parser('network', description=networkdelete_desc,
                                                         help=networkdelete_desc)
     networkdelete_parser.add_argument('-y', '--yes', action='store_true', help='Dont ask for confirmation')
-    networkdelete_parser.add_argument('name', metavar='NETWORK')
+    networkdelete_parser.add_argument('name', metavar='NETWORK', nargs='+')
     networkdelete_parser.set_defaults(func=delete_network)
 
     pipelinecreate_desc = 'Create Pipeline'
@@ -2904,6 +2925,16 @@ def cli():
     imagedownload_parser.set_defaults(func=download_image)
     download_subparsers.add_parser('image', parents=[imagedownload_parser], description=imagedownload_desc,
                                    help=imagedownload_desc, aliases=['iso'])
+
+    okddownload_desc = 'Download Okd Installer'
+    okddownload_parser = argparse.ArgumentParser(add_help=False)
+    okddownload_parser.add_argument('-P', '--param', action='append',
+                                          help='Define parameter for rendering (can specify multiple)', metavar='PARAM')
+    okddownload_parser.add_argument('--paramfile', help='Parameters file', metavar='PARAMFILE')
+    okddownload_parser.set_defaults(func=download_okd_installer)
+    download_subparsers.add_parser('okd-installer', parents=[okddownload_parser],
+                                   description=okddownload_desc,
+                                   help=okddownload_desc)
 
     openshiftdownload_desc = 'Download Openshift Installer'
     openshiftdownload_parser = argparse.ArgumentParser(add_help=False)

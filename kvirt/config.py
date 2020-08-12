@@ -626,14 +626,14 @@ class Kconfig(Kbaseconfig):
                 if not os.path.exists(notifyscript):
                     notifycmd = None
                     notifyscript = None
-                    common.pprint("Notification required but missing notifyscript", color='red')
+                    common.pprint("Notification required but missing notifyscript", color='yellow')
                 else:
                     files.append({'path': '/root/.notify.sh', 'origin': notifyscript})
                     notifycmd = "bash /root/.notify.sh"
             for notifymethod in notifymethods:
                 if notifymethod == 'pushbullet':
                     if pushbullettoken is None:
-                        common.pprint("Notification required but missing pushbullettoken", color='red')
+                        common.pprint("Notification required but missing pushbullettoken", color='yellow')
                     elif notifyscript is None and notifycmd is None:
                         continue
                     else:
@@ -649,9 +649,9 @@ class Kconfig(Kbaseconfig):
                             cmds.append(pbcmd)
                 elif notifymethod == 'slack':
                     if slackchannel is None:
-                        common.pprint("Notification required but missing slack channel", color='red')
+                        common.pprint("Notification required but missing slack channel", color='yellow')
                     elif slacktoken is None:
-                        common.pprint("Notification required but missing slacktoken", color='red')
+                        common.pprint("Notification required but missing slacktoken", color='yellow')
                     else:
                         title = "Vm %s on %s report" % (name, self.client)
                         slackcmd = "info=`%s 2>&1 | sed 's/\\x2/ /g'`;" % notifycmd
@@ -667,11 +667,11 @@ class Kconfig(Kbaseconfig):
                             cmds.append(slackcmd)
                 elif notifymethod == 'mail':
                     if mailserver is None:
-                        common.pprint("Notification required but missing mailserver", color='red')
+                        common.pprint("Notification required but missing mailserver", color='yellow')
                     elif mailfrom is None:
-                        common.pprint("Notification required but missing mailfrom", color='red')
+                        common.pprint("Notification required but missing mailfrom", color='yellow')
                     elif not mailto:
-                        common.pprint("Notification required but missing mailto", color='red')
+                        common.pprint("Notification required but missing mailto", color='yellow')
                     else:
                         title = "Vm %s on %s report" % (name, self.client)
                         now = datetime.now()
@@ -781,16 +781,19 @@ $INFO
                 common.pprint("Client %s not found. Skipping" % dnsclient, color='blue')
         ansibleprofile = profile.get('ansible')
         if ansibleprofile is not None:
-            for element in ansibleprofile:
-                if 'playbook' not in element:
-                    continue
-                playbook = element['playbook']
-                variables = element.get('variables', {})
-                verbose = element.get('verbose', False)
-                user = element.get('user')
-                ansibleutils.play(k, name, playbook=playbook, variables=variables, verbose=verbose, user=user,
-                                  tunnel=self.tunnel, tunnelhost=self.host, tunnelport=self.port, tunneluser=self.user,
-                                  yamlinventory=yamlinventory)
+            if find_executable('ansible-playbook') is None:
+                common.pprint("ansible-playbook executable not found. Skipping ansible play", color='yellow')
+            else:
+                for element in ansibleprofile:
+                    if 'playbook' not in element:
+                        continue
+                    playbook = element['playbook']
+                    variables = element.get('variables', {})
+                    verbose = element.get('verbose', False)
+                    user = element.get('user')
+                    ansibleutils.play(k, name, playbook=playbook, variables=variables, verbose=verbose, user=user,
+                                      tunnel=self.tunnel, tunnelhost=self.host, tunnelport=self.port,
+                                      tunneluser=self.user, yamlinventory=yamlinventory, insecure=self.insecure)
         if os.access(os.path.expanduser('~/.kcli'), os.W_OK):
             client = client if client is not None else self.client
             common.set_lastvm(name, client)
@@ -812,7 +815,7 @@ $INFO
         for vm in k.list():
             vmname = vm['name']
             plan = vm.get('plan')
-            if plan is None or plan == 'kvirt':
+            if plan is None or plan == 'kvirt' or plan == '':
                 continue
             elif plan not in plans:
                 plans[plan] = [vmname]
@@ -1652,11 +1655,8 @@ $INFO
                 if verbose:
                     ansiblecommand += " -vvv"
                 inventoryfile = "/tmp/%s.inv.yaml" % plan if self.yamlinventory else "/tmp/%s.inv" % plan
-                if os.path.exists(inventoryfile):
-                    common.pprint("Inventory in %s skipped!" % inventoryfile, color='blue')
-                else:
-                    ansibleutils.make_plan_inventory(vms_to_host, plan, newvms, groups=groups, user=user,
-                                                     yamlinventory=self.yamlinventory)
+                ansibleutils.make_plan_inventory(vms_to_host, plan, newvms, groups=groups, user=user,
+                                                 yamlinventory=self.yamlinventory, insecure=self.insecure)
                 if not os.path.exists('~/.ansible.cfg'):
                     ansibleconfig = os.path.expanduser('~/.ansible.cfg')
                     with open(ansibleconfig, "w") as f:
@@ -1667,10 +1667,10 @@ $INFO
                         yaml.dump(variables, f, default_flow_style=False)
                     ansiblecommand += " --extra-vars @%s" % (varsfile)
                 ansiblecommand += " -i  %s %s" % (inventoryfile, playbook)
-                print("Running: %s" % (ansiblecommand))
+                common.pprint("Running: %s" % ansiblecommand, color='blue')
                 os.system(ansiblecommand)
         if ansible:
-            common.pprint("Deploying Ansible Inventory...")
+            common.pprint("Deploying Ansible Inventory...", color='blue')
             inventoryfile = "/tmp/%s.inv.yaml" % plan if self.yamlinventory else "/tmp/%s.inv" % plan
             if os.path.exists(inventoryfile):
                 common.pprint("Inventory in %s skipped!" % inventoryfile, color='blue')
@@ -1682,7 +1682,8 @@ $INFO
                     description = vm['plan']
                     if description == plan:
                         vms.append(name)
-                ansibleutils.make_plan_inventory(vms_to_host, plan, vms, yamlinventory=self.yamlinventory)
+                ansibleutils.make_plan_inventory(vms_to_host, plan, vms, yamlinventory=self.yamlinventory,
+                                                 insecure=self.insecure)
                 return
         if lbs:
             common.pprint("Deploying Loadbalancers...")
@@ -1721,7 +1722,7 @@ $INFO
         return returndata
 
     def handle_host(self, pool=None, image=None, switch=None, download=False,
-                    url=None, cmd=None, sync=False, update_profile=False):
+                    url=None, cmd=None, sync=False, update_profile=False, commit=None):
         """
 
         :param pool:
@@ -1747,7 +1748,10 @@ $INFO
                         return {'result': 'failure', 'reason': "Incorrect image"}
                     url = IMAGES[image]
                     if 'rhcos' in image:
-                        url = common.get_latest_rhcos(url, _type=self.type)
+                        if commit is not None:
+                            url = common.get_commit_rhcos(commit, _type=self.type)
+                        else:
+                            url = common.get_latest_rhcos(url, _type=self.type)
                     if 'fcos' in image:
                         url = common.get_latest_fcos(url, _type=self.type)
                     image = os.path.basename(image)
@@ -1969,10 +1973,18 @@ $INFO
 
     def download_openshift_installer(self, overrides={}):
         pull_secret = overrides.get('pull_secret', 'openshift_pull.json')
+        version = overrides.get('version', 'stable')
         tag = overrides.get('tag', '4.5')
         upstream = overrides.get('upstream', False)
         macosx = True if os.path.exists('/Users') else False
-        openshift.get_ci_installer(pull_secret, tag=tag, macosx=macosx, upstream=upstream)
+        if version == 'ci':
+            openshift.get_ci_installer(pull_secret, tag=tag, macosx=macosx, upstream=upstream)
+        elif version == 'nightly':
+            openshift.get_downstream_installer(nightly=True, tag=tag, macosx=macosx)
+        elif upstream:
+            openshift.get_upstream_installer(tag=tag, macosx=macosx)
+        else:
+            openshift.get_downstream_installer(tag=tag, macosx=macosx)
 
     def expose_plan(self, plan, inputfile=None, overrides={}):
         inputfile = os.path.expanduser(inputfile)
