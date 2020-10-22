@@ -28,6 +28,8 @@ TUNNELHOST = None
 TUNNELUSER = 'root'
 TUNNELDIR = '/var/www/html'
 TUNNELPORT = 22
+VMUSER = None
+VMPORT = None
 IMAGES = {'arch': 'https://linuximages.de/openstack/arch/arch-openstack-LATEST-image-bootstrap.qcow2',
           'centos6': 'https://cloud.centos.org/centos/6/images/CentOS-6-x86_64-GenericCloud.qcow2',
           'centos7': 'https://cloud.centos.org/centos/7/images/CentOS-7-x86_64-GenericCloud.qcow2',
@@ -55,6 +57,7 @@ IMAGES = {'arch': 'https://linuximages.de/openstack/arch/arch-openstack-LATEST-i
           'netbsd81': 'https://bsd-cloud-image.org/images/netbsd/8.1/netbsd-8.1.qcow2',
           'netbsd90': 'https://bsd-cloud-image.org/images/netbsd/9.0/netbsd-9.0.qcow2',
           'openbsd66': 'https://bsd-cloud-image.org/images/openbsd/6.6/openbsd-6.6.qcow2',
+          'openbsd67': 'https://bsd-cloud-image.org/images/openbsd/6.7/openbsd-6.7.qcow2',
           'gentoo': 'https://gentoo.osuosl.org/experimental/amd64/openstack/gentoo-openstack-amd64-default-20180621.'
           'qcow2',
           'opensuse': 'https://download.opensuse.org/repositories/Cloud:/Images:/Leap_15.2/images/'
@@ -92,13 +95,13 @@ ENABLEROOT = False
 PLANVIEW = False
 PRIVATEKEY = False
 TAGS = []
+NETWORKWAIT = 0
 RHNREGISTER = False
 RHNUSER = None
 RHNPASSWORD = None
 RHNAK = None
 RHNORG = None
 RHNPOOL = None
-RHNWAIT = 0
 FLAVOR = None
 KEEP_NETWORKS = False
 DNSCLIENT = None
@@ -174,5 +177,8 @@ oEO8BRcXIiXiQqW9KnF99fXOiQ/cKYh3kWBBPnuEOhC77Ke5aMlqMNOPULf3PMix
 2bqeJlbpLt7PkZBSawXeu6sAhRsqlpEmiPGn8ujH/oKwIAgm
 -----END CERTIFICATE-----"""
 VIRTTYPE = None
-ZEROTIER = []
+ZEROTIER_NETS = []
+ZEROTIER_KUBELET = False
+METADATA_FIELDS = ['plan', 'image', 'profile', 'owner', 'dnsclient', 'domain', 'kube', 'kubetype', 'loadbalancer']
+CLIENTRULES = []
 CACHE = False

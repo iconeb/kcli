@@ -6,6 +6,7 @@ from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
 from kvirt import common
+from kvirt.defaults import METADATA_FIELDS
 from math import ceil
 from pyVmomi import vim, vmodl
 from pyVim import connect
@@ -13,6 +14,7 @@ import os
 import requests
 import random
 from ssl import _create_unverified_context, get_server_certificate
+from tempfile import TemporaryDirectory
 import time
 import pyVmomi
 import webbrowser
@@ -347,10 +349,9 @@ class Ksphere:
                disks=[{'size': 10}], disksize=10, diskthin=True, diskinterface='virtio', nets=['default'], iso=None,
                vnc=False, cloudinit=True, reserveip=False, reservedns=False, reservehost=False, start=True, keys=None,
                cmds=[], ips=None, netmasks=None, gateway=None, nested=True, dns=None, domain=None, tunnel=False,
-               files=[], enableroot=True, overrides={}, tags=[], dnsclient=None, storemetadata=False,
-               sharedfolders=[], kernel=None, initrd=None, cmdline=None, placement=[], autostart=False,
-               cpuhotplug=False, memoryhotplug=False, numamode=None, numa=[], pcidevices=[], tpm=False, rng=False,
-               kube=None, kubetype=None):
+               files=[], enableroot=True, overrides={}, tags=[], storemetadata=False, sharedfolders=[],
+               kernel=None, initrd=None, cmdline=None, placement=[], autostart=False, cpuhotplug=False,
+               memoryhotplug=False, numamode=None, numa=[], pcidevices=[], tpm=False, rng=False, metadata={}):
         dc = self.dc
         vmFolder = dc.vmFolder
         distributed = self.distributed
@@ -413,15 +414,19 @@ class Ksphere:
                     # customspec = makecuspec(name, nets=nets, gateway=gateway, dns=dns, domain=domain)
                     # clonespec.customization = customspec
                     cloudinitiso = "[%s]/%s/%s.ISO" % (default_pool, name, name)
-                    common.cloudinit(name=name, keys=keys, cmds=cmds, nets=nets, gateway=gateway, dns=dns,
-                                     domain=domain, reserveip=reserveip, files=files, enableroot=enableroot,
-                                     overrides=overrides, storemetadata=storemetadata)
+                    userdata, metadata, netdata = common.cloudinit(name=name, keys=keys, cmds=cmds, nets=nets,
+                                                                   gateway=gateway, dns=dns, domain=domain,
+                                                                   reserveip=reserveip, files=files,
+                                                                   enableroot=enableroot, overrides=overrides,
+                                                                   storemetadata=storemetadata)
             confspec.extraConfig = extraconfig
             t = imageobj.CloneVM_Task(folder=vmfolder, name=name, spec=clonespec)
             waitForMe(t)
             if cloudinitiso is not None:
-                cloudinitisofile = "/tmp/%s.ISO" % name
-                self._uploadimage(default_pool, cloudinitisofile, name)
+                with TemporaryDirectory() as tmpdir:
+                    common.make_iso(name, tmpdir, userdata, metadata, netdata)
+                    cloudinitisofile = "%s/%s.ISO" % (tmpdir, name)
+                    self._uploadimage(default_pool, cloudinitisofile, name)
                 vm = findvm(si, vmFolder, name)
                 c = changecd(self.si, vm, cloudinitiso)
                 waitForMe(c)
@@ -431,22 +436,12 @@ class Ksphere:
         confspec.annotation = name
         confspec.memoryMB = memory
         confspec.numCPUs = numcpus
-        planopt = vim.option.OptionValue()
-        planopt.key = 'plan'
-        planopt.value = plan
-        profileopt = vim.option.OptionValue()
-        profileopt.key = 'profile'
-        profileopt.value = profile
-        confspec.extraConfig = [planopt, profileopt]
-        if kube is not None and kubetype is not None:
-            kubeopt = vim.option.OptionValue()
-            kubeopt.key = 'kube'
-            kubeopt.value = kube
-            confspec.extraConfig.append(kubeopt)
-            kubetypeopt = vim.option.OptionValue()
-            kubetypeopt.key = 'kubetype'
-            kubetypeopt.value = kubetype
-            confspec.extraConfig.append(kubetypeopt)
+        confspec.extraConfig = []
+        for entry in [field for field in metadata if field in METADATA_FIELDS]:
+            opt = vim.option.OptionValue()
+            opt.key = entry
+            opt.value = metadata[entry]
+            confspec.extraConfig.append(opt)
         if nested:
             confspec.nestedHVEnabled = True
         confspec.guestId = 'centos7_64Guest'
@@ -746,11 +741,11 @@ class Ksphere:
                 yamlinfo['nets'].append(net)
             if type(dev).__name__ == 'vim.vm.device.VirtualDisk':
                 device = "disk%s" % dev.unitNumber
-                disksize = convert(1000 * dev.capacityInKB)
+                disksize = convert(1000 * dev.capacityInKB, GB=False)
                 diskformat = dev.backing.diskMode
                 drivertype = 'thin' if dev.backing.thinProvisioned else 'thick'
                 path = dev.backing.datastore.name
-                disk = {'device': device, 'size': disksize, 'format': diskformat, 'type': drivertype, 'path': path}
+                disk = {'device': device, 'size': int(disksize), 'format': diskformat, 'type': drivertype, 'path': path}
                 yamlinfo['disks'].append(disk)
         if vm.runtime.powerState == "poweredOn":
             yamlinfo['host'] = vm.runtime.host.name
@@ -760,16 +755,9 @@ class Ksphere:
                 if currentmac == mainmac and currentips:
                     yamlinfo['ip'] = currentips[0]
         for entry in vm.config.extraConfig:
-            if entry.key == 'plan':
-                yamlinfo['plan'] = entry.value
-            if entry.key == 'kube':
-                yamlinfo['kube'] = entry.value
-            if entry.key == 'kubetype':
-                yamlinfo['kubetype'] = entry.value
-            if entry.key == 'profile':
-                yamlinfo['profile'] = entry.value
+            if entry.key in METADATA_FIELDS:
+                yamlinfo[entry.key] = entry.value
             if entry.key == 'image':
-                yamlinfo['image'] = entry.value
                 yamlinfo['user'] = common.get_user(entry.value)
         if debug:
             yamlinfo['debug'] = vm.config.extraConfig
@@ -951,31 +939,6 @@ class Ksphere:
 
     def get_pool_path(self, pool):
         return pool
-
-    def ssh(self, name, user=None, local=None, remote=None, tunnel=False, tunnelhost=None, tunnelport=22,
-            tunneluser='root', insecure=False, cmd=None, X=False, Y=False, D=None):
-        u, ip = common._ssh_credentials(self, name)
-        if ip is None:
-            return None
-        if user is None:
-            user = u
-        sshcommand = common.ssh(name, ip=ip, user=user, local=local, remote=remote, tunnel=tunnel,
-                                tunnelhost=tunnelhost, tunnelport=tunnelport, tunneluser=tunneluser, insecure=insecure,
-                                cmd=cmd, X=X, Y=Y, D=D, debug=self.debug)
-        return sshcommand
-
-    def scp(self, name, user=None, source=None, destination=None, tunnel=False, tunnelhost=None, tunnelport=22,
-            tunneluser='root', download=False, recursive=False,
-            insecure=False):
-        u, ip = common._ssh_credentials(self, name)
-        if ip is None:
-            return None
-        if user is None:
-            user = u
-        scpcommand = common.scp(name, ip=ip, user=user, source=source, destination=destination, recursive=recursive,
-                                tunnel=tunnel, tunnelhost=tunnelhost, tunnelport=tunnelport, tunneluser=tunneluser,
-                                debug=self.debug, download=download, insecure=insecure)
-        return scpcommand
 
     def add_disk(self, name, size=1, pool=None, thin=True, image=None, shareable=False, existing=None,
                  interface='virtio'):

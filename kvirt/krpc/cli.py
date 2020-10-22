@@ -14,7 +14,8 @@ from kvirt.examples import hostcreate, _list, plancreate, planinfo, productinfo,
 from kvirt.examples import kubegenericcreate, kubeopenshiftcreate
 from kvirt.examples import dnscreate, diskcreate, diskdelete, vmcreate, vmconsole, vmexport, niccreate, nicdelete
 from kvirt.containerconfig import Kcontainerconfig
-from kvirt.defaults import IMAGES
+from kvirt.defaults import IMAGES, VERSION
+from kvirt import version
 from prettytable import PrettyTable
 import argcomplete
 import argparse
@@ -22,9 +23,8 @@ from kvirt.krpc import commoncli as common
 from kvirt import nameutils
 import os
 import random
-import re
+import requests
 import sys
-from urllib.request import urlopen
 
 
 class Kconfig():
@@ -34,7 +34,6 @@ class Kconfig():
         self.baseconfig = self.config
         clientinfo = self.config.get_config(empty())
         currentclient = clientinfo.client
-        self.planview = False
         self.client = clientinfo.client
         self.extraclients = [c for c in clientinfo.extraclients]
         if client is not None:
@@ -98,24 +97,17 @@ def get_subparser(parser, subcommand):
 
 
 def get_version(args):
-    url = "https://github.com/karmab/kcli"
-    baseconfig = Kconfig(client=args.client, debug=args.debug).baseconfig
-    version = baseconfig.get_version(empty())
-    VERSION, git_version = version.version, version.git_version
     full_version = "version: %s" % VERSION
+    versiondir = os.path.dirname(version.__file__)
+    git_version = open('%s/git' % versiondir).read().rstrip() if os.path.exists('%s/git' % versiondir) else 'N/A'
     full_version += " commit: %s" % git_version
     update = 'N/A'
     if git_version != 'N/A':
-        update = False
-        r = urlopen("%s/commits/master" % url)
-        for line in r.readlines():
-            if '%s/commits/master?' % url in str(line, 'utf-8').strip():
-                tag_match = re.match('.*=(.*)\\+..".*', str(line, 'utf-8'))
-                if tag_match is not None:
-                    upstream_version = tag_match.group(1)[:7]
-                    if upstream_version != git_version:
-                        update = True
-                break
+        try:
+            upstream_version = requests.get("https://api.github.com/repos/karmab/kcli/commits/master").json()['sha'][:7]
+            update = True if upstream_version != git_version else False
+        except:
+            pass
     full_version += " Available Updates: %s" % update
     print(full_version)
 
@@ -414,6 +406,8 @@ def info_vm(args):
             if vm.snapshots:
                 data['snapshots'] = [{'snapshot': snapshot.snapshot, 'current': snapshot.current} for
                                      snapshot in vm.snapshots]
+            if vm.iso:
+                data['iso'] = vm.iso
             if args.debug:
                 data['debug'] = vm.debug
             print(common.print_info(data, output=output, fields=fields, values=values, pretty=True))
@@ -494,8 +488,6 @@ def list_vm(args):
             plan = vm.plan
             profile = vm.profile
             vminfo = [name, status, ip, source, plan, profile]
-            if config.planview and vm[4] != config.currentplan:
-                continue
             if filters:
                 if status == filters:
                     vms.add_row(vminfo)
@@ -1680,12 +1672,15 @@ def ssh_vm(args):
     else:
         name = args.name[0]
     sshcommand = k.ssh(kcli_pb2.vm(name=name, user=user, l=l, r=r, X=X, Y=Y, D=D, cmd=cmd)).sshcmd
-    if args.debug:
-        print(sshcommand)
-    if find_executable('ssh') is not None:
-        os.system(sshcommand)
+    if sshcommand != '':
+        if args.debug:
+            print(sshcommand)
+        if find_executable('ssh') is not None:
+            os.system(sshcommand)
+        else:
+            print(sshcommand)
     else:
-        print(sshcommand)
+        common.pprint("Couldn't run ssh", color='red')
 
 
 def scp_vm(args):
@@ -1708,10 +1703,14 @@ def scp_vm(args):
         return
     if '@' in name and len(name.split('@')) == 2:
         user, name = name.split('@')
+    if download:
+        common.pprint("Retrieving file %s from %s" % (source, name), color='green')
+    else:
+        common.pprint("Copying file %s to %s" % (source, name), color='green')
     scpdetails = kcli_pb2.scpdetails(name=name, user=user, source=source, destination=destination, download=download,
                                      recursive=recursive)
     scpcommand = k.scp(scpdetails).sshcmd
-    if scpcommand is not None:
+    if scpcommand != '':
         if find_executable('scp') is not None:
             os.system(scpcommand)
         else:

@@ -21,6 +21,7 @@ import json
 import os
 from subprocess import call
 from shutil import move
+from tempfile import TemporaryDirectory
 import yaml
 
 binary_types = ['bz2', 'deb', 'jpg', 'gz', 'jpeg', 'iso', 'png', 'rpm', 'tgz', 'zip', 'ks']
@@ -61,7 +62,7 @@ def fetch(url, path):
 
 
 def cloudinit(name, keys=[], cmds=[], nets=[], gateway=None, dns=None, domain=None, reserveip=False, files=[],
-              enableroot=True, overrides={}, iso=True, fqdn=False, storemetadata=True, image=None, ipv6=[]):
+              enableroot=True, overrides={}, fqdn=False, storemetadata=True, image=None, ipv6=[]):
     """
 
     :param name:
@@ -78,6 +79,7 @@ def cloudinit(name, keys=[], cmds=[], nets=[], gateway=None, dns=None, domain=No
     :param iso:
     :param fqdn:
     """
+    userdata, metadata, netdata = None, None, None
     default_gateway = gateway
     legacy = True if image is not None and is_7(image) else False
     prefix = 'ens' if image is not None and is_debian(image) else 'eth'
@@ -178,86 +180,73 @@ def cloudinit(name, keys=[], cmds=[], nets=[], gateway=None, dns=None, domain=No
                         netdata[nicname] = {'dhcp6': True}
                     else:
                         netdata[nicname] = {'dhcp4': True}
-    with open('/tmp/meta-data', 'w') as metadatafile:
-        if domain is not None:
-            localhostname = "%s.%s" % (name, domain)
-        else:
-            localhostname = name
-        metadata = {"instance-id": localhostname, "local-hostname": localhostname}
-        if legacy and netdata != '':
-            metadata["network-interfaces"] = netdata
-        metadatafile.write(json.dumps(metadata))
-    if not legacy and netdata:
-        with open('/tmp/network-config', 'w') as netfile:
+    if domain is not None:
+        localhostname = "%s.%s" % (name, domain)
+    else:
+        localhostname = name
+    metadata = {"instance-id": localhostname, "local-hostname": localhostname}
+    if legacy and netdata != '':
+        metadata["network-interfaces"] = netdata
+    metadata = json.dumps(metadata)
+    if not legacy:
+        if netdata:
             netdata = {'version': 2, 'ethernets': netdata}
-            yaml.safe_dump(netdata, netfile, default_flow_style=False, encoding='utf-8')
+            netdata = yaml.safe_dump(netdata, default_flow_style=False, encoding='utf-8').decode("utf-8")
+        else:
+            netdata = ''
     existing = "%s.cloudinit" % name if not os.path.exists('/i_am_a_container') else "/workdir/%s.cloudinit" % name
     if os.path.exists(existing):
         pprint("using cloudinit from existing %s for %s" % (existing, name), color="blue")
-        with open('/tmp/user-data', 'w') as userdata:
-            userdata.write(open(existing).read())
+        userdata = open(existing).read()
     else:
-        with open('/tmp/user-data', 'w') as userdata:
-            userdata.write('#cloud-config\nhostname: %s\n' % name)
-            if fqdn:
-                fqdn = "%s.%s" % (name, domain) if domain is not None else name
-                userdata.write("fqdn: %s\n" % fqdn)
-            if enableroot:
-                userdata.write("ssh_pwauth: True\ndisable_root: false\n")
-            if domain is not None:
-                userdata.write("fqdn: %s.%s\n" % (name, domain))
-            if keys or os.path.exists(os.path.expanduser("~/.ssh/id_rsa.pub"))\
-                    or os.path.exists(os.path.expanduser("~/.ssh/id_dsa.pub"))\
-                    or os.path.exists(os.path.expanduser("~/.kcli/id_rsa.pub"))\
-                    or os.path.exists(os.path.expanduser("~/.kcli/id_dsa.pub")):
-                userdata.write("ssh_authorized_keys:\n")
-            else:
-                pprint("neither id_rsa or id_dsa public keys found in your .ssh or .kcli directory, you might have "
-                       "trouble accessing the vm", color='red')
-            if keys:
-                for key in list(set(keys)):
-                    userdata.write("- %s\n" % key)
-            publickeyfile = None
-            if os.path.exists(os.path.expanduser("~/.ssh/id_rsa.pub")):
-                publickeyfile = os.path.expanduser("~/.ssh/id_rsa.pub")
-            elif os.path.exists(os.path.expanduser("~/.ssh/id_dsa.pub")):
-                publickeyfile = os.path.expanduser("~/.ssh/id_dsa.pub")
-            elif os.path.exists(os.path.expanduser("~/.kcli/id_rsa.pub")):
-                publickeyfile = os.path.expanduser("~/.kcli/id_rsa.pub")
-            elif os.path.exists(os.path.expanduser("~/.kcli/id_dsa.pub")):
-                publickeyfile = os.path.expanduser("~/.kcli/id_dsa.pub")
-            if publickeyfile is not None:
+        userdata = '#cloud-config\nhostname: %s\n' % name
+        if fqdn:
+            fqdn = "%s.%s" % (name, domain) if domain is not None else name
+            userdata += "fqdn: %s\n" % fqdn
+        if enableroot:
+            userdata += "ssh_pwauth: True\ndisable_root: false\n"
+        if domain is not None:
+            userdata += "fqdn: %s.%s\n" % (name, domain)
+        if keys or os.path.exists(os.path.expanduser("~/.ssh/id_rsa.pub"))\
+                or os.path.exists(os.path.expanduser("~/.ssh/id_dsa.pub"))\
+                or os.path.exists(os.path.expanduser("~/.kcli/id_rsa.pub"))\
+                or os.path.exists(os.path.expanduser("~/.kcli/id_dsa.pub")):
+            userdata += "ssh_authorized_keys:\n"
+        else:
+            pprint("neither id_rsa or id_dsa public keys found in your .ssh or .kcli directory, you might have "
+                   "trouble accessing the vm", color='yellow')
+        if keys:
+            for key in list(set(keys)):
+                userdata += "- %s\n" % key
+        for path in ["~/.kcli/id_rsa.pub", "~/.kcli/id_dsa.pub", "~/.ssh/id_rsa.pub", "~/.ssh/id_dsa.pub"]:
+            expanded_path = os.path.expanduser(path)
+            if os.path.exists(expanded_path) and os.path.exists(expanded_path.replace('.pub', '')):
+                publickeyfile = expanded_path
                 with open(publickeyfile, 'r') as ssh:
                     key = ssh.read().rstrip()
-                    userdata.write("- %s\n" % key)
-            if cmds:
-                data = process_cmds(cmds, overrides)
-                if data != '':
-                    userdata.write("runcmd:\n")
-                    userdata.write(data)
-            userdata.write('ssh_pwauth: True\n')
-            userdata.write('disable_root: false\n')
-            if storemetadata and overrides:
-                storeoverrides = {k: overrides[k] for k in overrides if k not in ['password', 'rhnpassword', 'rhnak']}
-                storedata = {'path': '/root/.metadata', 'content': yaml.dump(storeoverrides, default_flow_style=False,
-                                                                             indent=2)}
-                if files:
-                    files.append(storedata)
-                else:
-                    files = [storedata]
+                    userdata += "- %s\n" % key
+                break
+        if cmds:
+            data = process_cmds(cmds, overrides)
+            if data != '':
+                userdata += "runcmd:\n"
+                userdata += data
+        userdata += 'ssh_pwauth: True\n'
+        userdata += 'disable_root: false\n'
+        if storemetadata and overrides:
+            storeoverrides = {k: overrides[k] for k in overrides if k not in ['password', 'rhnpassword', 'rhnak']}
+            storedata = {'path': '/root/.metadata', 'content': yaml.dump(storeoverrides, default_flow_style=False,
+                                                                         indent=2)}
             if files:
-                data = process_files(files=files, overrides=overrides)
-                if data != '':
-                    userdata.write("write_files:\n")
-                    userdata.write(data)
-    if iso:
-        isocmd = 'mkisofs'
-        if find_executable('genisoimage') is not None:
-            isocmd = 'genisoimage'
-        isocmd += " --quiet -o /tmp/%s.ISO --volid cidata --joliet --rock /tmp/user-data /tmp/meta-data" % name
-        if not legacy and netdata:
-            isocmd += " /tmp/network-config"
-        os.system(isocmd)
+                files.append(storedata)
+            else:
+                files = [storedata]
+        if files:
+            data = process_files(files=files, overrides=overrides)
+            if data != '':
+                userdata += "write_files:\n"
+                userdata += data
+    return userdata.strip(), metadata, netdata
 
 
 def process_files(files=[], overrides={}):
@@ -365,7 +354,8 @@ def process_ignition_files(files=[], overrides={}):
     :param overrides:
     :return:
     """
-    data = []
+    filesdata = []
+    unitsdata = []
     for directory in files:
         if not isinstance(directory, dict) or 'origin' not in directory\
                 or not os.path.isdir(os.path.expanduser(directory['origin'])):
@@ -417,10 +407,14 @@ def process_ignition_files(files=[], overrides={}):
             continue
         if not isinstance(content, str):
             content = '\n'.join(content) + '\n'
-        content = quote(content)
-        data.append({'filesystem': 'root', 'path': path, 'mode': permissions, 'overwrite': True,
-                     "contents": {"source": "data:,%s" % content, "verification": {}}})
-    return data
+        if path.endswith('.service'):
+            unitsdata.append({"contents": content, "name": os.path.basename(path), "enabled": True})
+        else:
+            content = base64.b64encode(content.encode()).decode("UTF-8")
+            filesdata.append({'filesystem': 'root', 'path': path, 'mode': permissions, 'overwrite': True,
+                              "contents": {"source": "data:text/plain;charset=utf-8;base64,%s" % content,
+                                           "verification": {}}})
+    return filesdata, unitsdata
 
 
 def process_cmds(cmds, overrides):
@@ -466,9 +460,9 @@ def process_ignition_cmds(cmds, overrides):
     else:
         if not content.startswith('#!'):
             content = "#!/bin/sh\n%s" % content
-        content = quote(content)
+        content = base64.b64encode(content.encode()).decode("UTF-8")
         data = {'filesystem': 'root', 'path': path, 'mode': int(permissions, 8),
-                "contents": {"source": "data:,%s" % content, "verification": {}}}
+                "contents": {"source": "data:text/plain;charset=utf-8;base64,%s" % content, "verification": {}}}
         return data
 
 
@@ -723,7 +717,7 @@ def print_info(yamlinfo, output='plain', fields=[], values=False, pretty=True):
             return yamlinfo
     else:
         result = ''
-        orderedfields = ['debug', 'name', 'project', 'namespace', 'instanceid', 'creationdate', 'owner', 'host',
+        orderedfields = ['debug', 'name', 'project', 'namespace', 'id', 'instanceid', 'creationdate', 'owner', 'host',
                          'status', 'description', 'autostart', 'image', 'user', 'plan', 'profile', 'flavor', 'cpus',
                          'memory', 'nets', 'ip', 'disks', 'snapshots']
         otherfields = [key for key in yamlinfo if key not in orderedfields]
@@ -803,8 +797,8 @@ def ssh(name, ip='', user=None, local=None, remote=None, tunnel=False, tunnelhos
         identityfile = None
         if os.path.exists(os.path.expanduser("~/.kcli/id_rsa")):
             identityfile = os.path.expanduser("~/.kcli/id_rsa")
-        elif os.path.exists(os.path.expanduser("~/.kcli/id_rsa")):
-            identityfile = os.path.expanduser("~/.kcli/id_rsa")
+        elif os.path.exists(os.path.expanduser("~/.kcli/id_dsa")):
+            identityfile = os.path.expanduser("~/.kcli/id_dsa")
         if identityfile is not None:
             sshcommand = "-i %s %s" % (identityfile, sshcommand)
         if D:
@@ -830,12 +824,12 @@ def ssh(name, ip='', user=None, local=None, remote=None, tunnel=False, tunnelhos
         if vmport is not None:
             sshcommand = "-p %s %s" % (vmport, sshcommand)
         if insecure:
-            sshcommand = "ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no %s"\
+            sshcommand = "ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o LogLevel=ERROR %s"\
                 % sshcommand
         else:
             sshcommand = "ssh %s" % sshcommand
         if debug:
-            print(sshcommand)
+            pprint(sshcommand, color='blue')
         return sshcommand
 
 
@@ -877,14 +871,14 @@ def scp(name, ip='', user=None, source=None, destination=None, recursive=None, t
             scpcommand = "%s -i %s" % (scpcommand, identityfile)
         if recursive:
             scpcommand = "%s -r" % scpcommand
-        if vmport is not None and tunnelhost == '127.0.0.1':
+        if vmport is not None:
             scpcommand = "%s -P %s" % (scpcommand, vmport)
         if download:
             scpcommand = "%s %s %s@%s:%s %s" % (scpcommand, arguments, user, ip, source, destination)
         else:
             scpcommand = "%s %s %s %s@%s:%s" % (scpcommand, arguments, source, user, ip, destination)
         if debug:
-            print(scpcommand)
+            pprint(scpcommand, color='blue')
         return scpcommand
 
 
@@ -928,16 +922,15 @@ def get_cloudinitfile(image):
     :return:
     """
     lower = image.lower()
-    if 'fedora' in lower or 'debian' in lower or 'ubuntu' in lower or [x for x in UBUNTUS if x in lower]:
-        cloudinitfile = '/var/log/cloud-init-output.log'
-    else:
+    cloudinitfile = '/var/log/cloud-init-output.log'
+    if 'centos-7' in lower or 'centos7' in lower:
         cloudinitfile = '/var/log/messages'
     return cloudinitfile
 
 
 def ignition(name, keys=[], cmds=[], nets=[], gateway=None, dns=None, domain=None, reserveip=False, files=[],
              enableroot=True, overrides={}, iso=True, fqdn=False, version='3.0.0', plan=None, compact=False,
-             removetls=False, ipv6=[], image=None):
+             removetls=False, ipv6=[], image=None, minimal=False):
     """
 
     :param name:
@@ -959,32 +952,29 @@ def ignition(name, keys=[], cmds=[], nets=[], gateway=None, dns=None, domain=Non
     indent = 0 if compact else 4
     default_gateway = gateway
     publickeys = []
-    publickeyfile = None
+    storage = {"files": []}
+    systemd = {"units": []}
     if domain is not None:
         localhostname = "%s.%s" % (name, domain)
     else:
         localhostname = name
-    if os.path.exists(os.path.expanduser("~/.ssh/id_rsa.pub")):
-        publickeyfile = os.path.expanduser("~/.ssh/id_rsa.pub")
-    elif os.path.exists(os.path.expanduser("~/.ssh/id_dsa.pub")):
-        publickeyfile = os.path.expanduser("~/.ssh/id_dsa.pub")
-    elif os.path.exists(os.path.expanduser("~/.kcli/id_rsa.pub")):
-        publickeyfile = os.path.expanduser("~/.kcli/id_rsa.pub")
-    elif os.path.exists(os.path.expanduser("~/.kcli/id_dsa.pub")):
-        publickeyfile = os.path.expanduser("~/.kcli/id_dsa.pub")
-    if publickeyfile is not None:
-        with open(publickeyfile, 'r') as ssh:
-            publickeys.append(ssh.read().rstrip())
-    if keys:
-        for key in list(set(keys)):
-            publickeys.append(key)
-    if not publickeys:
-        pprint("neither id_rsa or id_dsa public keys found in your .ssh or .kcli directory, you might have trouble "
-               "accessing the vm", color='red')
-    storage = {"files": []}
-    hostnameline = quote("%s\n" % localhostname)
-    storage["files"].append({"filesystem": "root", "path": "/etc/hostname", "overwrite": True,
-                             "contents": {"source": "data:,%s" % hostnameline, "verification": {}}, "mode": 420})
+    if not minimal:
+        for path in ["~/.kcli/id_rsa.pub", "~/.kcli/id_dsa.pub", "~/.ssh/id_rsa.pub", "~/.ssh/id_dsa.pub"]:
+            expanded_path = os.path.expanduser(path)
+            if os.path.exists(expanded_path) and os.path.exists(expanded_path.replace('.pub', '')):
+                publickeyfile = expanded_path
+                with open(publickeyfile, 'r') as ssh:
+                    publickeys.append(ssh.read().strip())
+                break
+        if keys:
+            for key in list(set(keys)):
+                publickeys.append(key)
+        if not publickeys:
+            pprint("neither id_rsa or id_dsa public keys found in your .ssh or .kcli directory, you might have trouble "
+                   "accessing the vm", color='red')
+        hostnameline = quote("%s\n" % localhostname)
+        storage["files"].append({"filesystem": "root", "path": "/etc/hostname", "overwrite": True,
+                                 "contents": {"source": "data:,%s" % hostnameline, "verification": {}}, "mode": 420})
     if dns is not None:
         nmline = quote("[main]\ndhcp=dhclient\n")
         storage["files"].append({"filesystem": "root", "path": "/etc/NetworkManager/conf.d/dhcp-client.conf",
@@ -1006,7 +996,7 @@ def ignition(name, keys=[], cmds=[], nets=[], gateway=None, dns=None, domain=Non
                 if image is not None and ('fcos' in image or 'fedora-coreos' in image):
                     nicname = "eth%d" % index
                 else:
-                    nicname = "ens%d" % index + 3
+                    nicname = "ens%d" % (index + 3)
                 ip = None
                 netmask = None
                 noconf = None
@@ -1055,9 +1045,11 @@ def ignition(name, keys=[], cmds=[], nets=[], gateway=None, dns=None, domain=Non
                                          "contents": {"source": "data:,%s" % static, "verification": {}},
                                          "mode": int(static_nic_file_mode, 8)})
     if files:
-        filesdata = process_ignition_files(files=files, overrides=overrides)
+        filesdata, unitsdata = process_ignition_files(files=files, overrides=overrides)
         if filesdata:
             storage["files"].extend(filesdata)
+        if unitsdata:
+            systemd["units"].extend(unitsdata)
     cmdunit = None
     if cmds:
         cmdsdata = process_ignition_cmds(cmds, overrides)
@@ -1066,22 +1058,19 @@ def ignition(name, keys=[], cmds=[], nets=[], gateway=None, dns=None, domain=Non
         content = "[Service]\nType=oneshot\nExecStart=%s\n[Install]\nWantedBy=multi-user.target\n" % firstpath
         cmdunit = {"contents": content, "name": "first-boot.service", "enabled": True}
     if cmdunit is not None:
-        systemd = {"units": [cmdunit]}
-    else:
-        systemd = {}
+        systemd["units"].append(cmdunit)
     data = {'ignition': {'version': version, 'config': {}}, 'storage': storage, 'systemd': systemd,
-            'networkd': {}, 'passwd': {'users': [{'name': 'core', 'sshAuthorizedKeys': publickeys}]}}
-    if enableroot:
-        pprint("Ignoring request to add ssh keys for root user as ignition currently complains about it", color='blue')
-        # rootdata = {'name': 'root', 'sshAuthorizedKeys': publickeys}
-        # data['passwd']['users'].append(rootdata)
+            'networkd': {}, 'passwd': {'users': []}}
+    if publickeys:
+        data['passwd']['users'] = [{'name': 'core', 'sshAuthorizedKeys': publickeys}]
     role = None
     if len(name.split('-')) == 3 and name.split('-')[1] in ['master', 'worker']:
         role = name.split('-')[1]
     elif len(name.split('-')) == 2 and name.split('-')[1] == 'bootstrap':
         role = name.split('-')[1]
     if role is not None:
-        ignitionclusterpath = find_ignition_files(role, plan=plan)
+        cluster = overrides.get('cluster', plan)
+        ignitionclusterpath = find_ignition_files(role, cluster=cluster)
         if ignitionclusterpath is not None:
             data = mergeignition(name, ignitionclusterpath, data)
         rolepath = "/workdir/%s-%s.ign" % (plan, role) if os.path.exists('/i_am_a_container') else "%s-%s.ign" % (plan,
@@ -1103,28 +1092,11 @@ def ignition(name, keys=[], cmds=[], nets=[], gateway=None, dns=None, domain=Non
     # remove duplicate files to please ignition v3
     paths = []
     storagefinal = []
-    fix_ceo = overrides.get('fix_ceo', False)
     for fileentry in data['storage']['files']:
         if fileentry['path'] not in paths:
-            if fix_ceo and 'bootstrap' in name and fileentry['path'] == '/usr/local/bin/bootkube.sh':
-                pprint("Patching bootkube in bootstrap ignition to handle single master", color='yellow')
-                content = base64.b64decode(fileentry['contents']['source'].split(',')[1])
-                ceofix = """cp etcd-bootstrap/manifests/* manifests/
-                cp /root/ceo.yaml manifests/0000_12_etcd-operator_01_operator.cr.yaml"""
-                content = content.decode("utf-8")
-                newcontent = content.replace('cp etcd-bootstrap/manifests/* manifests/', ceofix)
-                newcontent = base64.b64encode(newcontent.encode()).decode("UTF-8")
-                newcontent = "data:text/plain;charset=utf-8;base64,%s" % newcontent
-                fileentry['contents']['source'] = newcontent
             storagefinal.append(fileentry)
             paths.append(fileentry['path'])
     data['storage']['files'] = storagefinal
-    if fix_ceo and 'bootstrap' in name:
-        ceo_base64 = base64.b64encode(ceo_yaml.encode()).decode("UTF-8")
-        ceo_source = "data:text/plain;charset=utf-8;base64,%s" % ceo_base64
-        ceo_entry = {"filesystem": "root", "path": "/root/ceo.yaml",
-                     "contents": {"source": ceo_source, "verification": {}}, "mode": 420}
-        data['storage']['files'].append(ceo_entry)
     try:
         result = json.dumps(data, sort_keys=True, indent=indent, separators=separators)
     except:
@@ -1208,15 +1180,18 @@ def get_latest_rhcos_metal(url):
             return kernel, initrd, metal
 
 
-def find_ignition_files(role, plan):
+def find_ignition_files(role, cluster):
+    clusterpath = os.path.expanduser("~/.kcli/clusters/%s/%s.ign" % (cluster, role))
     if os.path.exists('/i_am_a_container'):
-        clusterpath = "/workdir/clusters/%s/%s.ign" % (plan, role)
-        rolepath = "/workdir/%s/%s.ign" % (plan, role)
+        oldclusterpath = "/workdir/clusters/%s/%s.ign" % (cluster, role)
+        rolepath = "/workdir/%s/%s.ign" % (cluster, role)
     else:
-        clusterpath = "clusters/%s/%s.ign" % (plan, role)
-        rolepath = "%s/%s.ign" % (plan, role)
+        oldclusterpath = "clusters/%s/%s.ign" % (cluster, role)
+        rolepath = "%s/%s.ign" % (cluster, role)
     if os.path.exists(clusterpath):
         return clusterpath
+    elif os.path.exists(oldclusterpath):
+        return oldclusterpath
     elif os.path.exists(rolepath):
         return rolepath
     else:
@@ -1343,16 +1318,22 @@ def _ssh_credentials(k, name):
     info = k.info(name, debug=False)
     if not info:
         return None, None
-    user, ip = info.get('user', 'root'), info.get('ip')
-    if ip is None:
-        pprint("No ip found. Cannot ssh...", color='red')
+    user, ip, status = info.get('user', 'root'), info.get('ip'), info.get('status')
+    if status in ['down', 'suspended', 'unknown']:
+        pprint("%s down" % name, color='red')
+    elif ip is None:
+        pprint("No ip found for %s" % name, color='red')
     return user, ip
 
 
 def mergeignition(name, ignitionextrapath, data):
     pprint("Merging ignition data from existing %s for %s" % (ignitionextrapath, name), color="blue")
     with open(ignitionextrapath, 'r') as extra:
-        ignitionextra = json.load(extra)
+        try:
+            ignitionextra = json.load(extra)
+        except:
+            pprint("Couldn't process %s. Ignoring" % (ignitionextrapath), color="warning")
+            return data
         children = {'storage': 'files', 'passwd': 'users', 'systemd': 'units'}
         for key in children:
             childrenkey2 = 'path' if key == 'storage' else 'name'
@@ -1378,9 +1359,10 @@ def mergeignition(name, ignitionextrapath, data):
                                         sshkey2 = x['sshAuthorizedKeys'] if 'sshAuthorizedKeys' in x else []
                                         password = x.get('passwordHash')
                                 sshkeys = sshkey1
-                                if sshkey2 != sshkey1:
-                                    sshkeys += sshkey2
+                                if sshkey2:
+                                    sshkeys.extend(sshkey2)
                                 if sshkeys:
+                                    sshkeys = list(dict.fromkeys([sshkey.strip() for sshkey in sshkeys]))
                                     newuser['sshAuthorizedKeys'] = sshkeys
                                 if password is not None:
                                     newuser['passwordHash'] = password
@@ -1485,18 +1467,127 @@ def get_kubectl():
     call(kubecmd, shell=True)
 
 
-def get_oc(macosx=False):
+def get_oc(version='latest', macosx=False):
     SYSTEM = 'macosx' if os.path.exists('/Users') else 'linux'
     pprint("Downloading oc in current directory", color='blue')
-    occmd = "curl -s https://mirror.openshift.com/pub/openshift-v4/clients/oc/latest/%s/oc.tar.gz" % SYSTEM
+    occmd = "curl -s https://mirror.openshift.com/pub/openshift-v4/clients/oc/%s/%s/oc.tar.gz" % (version, SYSTEM)
     occmd += "| tar zxf - oc"
     occmd += "; chmod 700 oc"
     call(occmd, shell=True)
     if os.path.exists('/i_am_a_container'):
         if macosx:
-            occmd = "curl -s https://mirror.openshift.com/pub/openshift-v4/clients/oc/latest/macosx/oc.tar.gz"
+            occmd = "curl -s https://mirror.openshift.com/pub/openshift-v4/clients/oc/%s/macosx/oc.tar.gz" % version
             occmd += "| tar zxf -C /workdir - oc"
             occmd += "; chmod 700 /workdir/oc"
             call(occmd, shell=True)
         else:
             move('oc', '/workdir/oc')
+
+
+def kube_create_app(config, appdir, overrides={}):
+    appdata = {'cluster': 'testk', 'domain': 'karmalabs.com', 'masters': 1}
+    cluster = appdata['cluster']
+    cwd = os.getcwd()
+    overrides['cwd'] = cwd
+    default_parameter_file = "%s/kcli_default.yml" % appdir
+    if os.path.exists(default_parameter_file):
+        with open(default_parameter_file, 'r') as entries:
+            appdefault = yaml.safe_load(entries)
+            appdata.update(appdefault)
+    appdata.update(overrides)
+    with TemporaryDirectory() as tmpdir:
+        for root, dirs, files in os.walk(appdir):
+            for name in files:
+                # pprint("Copying %s to tmpdir %s" % (name, tmpdir), color='blue')
+                rendered = config.process_inputfile(cluster, "%s/%s" % (appdir, name), overrides=appdata)
+                with open("%s/%s" % (tmpdir, name), 'w') as f:
+                    f.write(rendered)
+        os.chdir(tmpdir)
+        result = call('bash %s/install.sh' % tmpdir, shell=True)
+    os.chdir(cwd)
+    return result
+
+
+def kube_delete_app(config, appdir, overrides={}):
+    found = False
+    cluster = 'xxx'
+    cwd = os.getcwd()
+    overrides['cwd'] = cwd
+    with TemporaryDirectory() as tmpdir:
+        for root, dirs, files in os.walk(appdir):
+            for name in files:
+                # pprint("Copying %s to tmpdir %s" % (name, tmpdir), color='blue')
+                if name == 'uninstall.sh':
+                    found = True
+                rendered = config.process_inputfile(cluster, "%s/%s" % (appdir, name), overrides=overrides)
+                with open("%s/%s" % (tmpdir, name), 'w') as f:
+                    f.write(rendered)
+        os.chdir(tmpdir)
+        if not found:
+            pprint("Uninstall not supported for this app", color='yellow')
+            result = 1
+        else:
+            result = call('bash %s/uninstall.sh' % tmpdir, shell=True)
+    os.chdir(cwd)
+    return result
+
+
+def make_iso(name, tmpdir, userdata, metadata, netdata):
+    with open("%s/user-data" % tmpdir, 'w') as x:
+        x.write(userdata)
+    with open("%s/meta-data" % tmpdir, 'w') as y:
+        y.write(metadata)
+    isocmd = 'mkisofs'
+    if find_executable('genisoimage') is not None:
+        isocmd = 'genisoimage'
+    isocmd += " --quiet -o %s/%s.ISO --volid cidata" % (tmpdir, name)
+    isocmd += " --joliet --rock %s/user-data %s/meta-data" % (tmpdir, tmpdir)
+    if netdata is not None:
+        with open("%s/network-config" % tmpdir, 'w') as z:
+            z.write(netdata)
+        isocmd += " %s/network-config" % tmpdir
+    os.system(isocmd)
+
+
+def patch_ceo(path):
+    separators = (',', ':')
+    indent = 0
+    pprint("Patching bootkube in bootstrap ignition to handle single master", color='yellow')
+    paths = []
+    storagefinal = []
+    with open(path, 'r') as ignition:
+        data = json.load(ignition)
+    for fileentry in data['storage']['files']:
+        if fileentry['path'] not in paths:
+            if fileentry['path'] == '/usr/local/bin/bootkube.sh':
+                content = base64.b64decode(fileentry['contents']['source'].split(',')[1])
+                ceofix = """cp etcd-bootstrap/manifests/* manifests/
+                cp /root/ceo.yaml manifests/0000_12_etcd-operator_01_operator.cr.yaml"""
+                content = content.decode("utf-8")
+                newcontent = content.replace('cp etcd-bootstrap/manifests/* manifests/', ceofix)
+                newcontent = base64.b64encode(newcontent.encode()).decode("UTF-8")
+                newcontent = "data:text/plain;charset=utf-8;base64,%s" % newcontent
+                fileentry['contents']['source'] = newcontent
+            storagefinal.append(fileentry)
+            paths.append(fileentry['path'])
+    data['storage']['files'] = storagefinal
+    ceo_base64 = base64.b64encode(ceo_yaml.encode()).decode("UTF-8")
+    ceo_source = "data:text/plain;charset=utf-8;base64,%s" % ceo_base64
+    ceo_entry = {"filesystem": "root", "path": "/root/ceo.yaml",
+                 "contents": {"source": ceo_source, "verification": {}}, "mode": 420}
+    data['storage']['files'].append(ceo_entry)
+    try:
+        result = json.dumps(data, sort_keys=True, indent=indent, separators=separators)
+    except:
+        result = json.dumps(data, indent=indent, separators=separators)
+    with open(path, 'w') as ignition:
+        ignition.write(result)
+    return data
+
+
+def word2number(cluster):
+    result = 0
+    for c in cluster:
+        entry = ord(c) - 96 if not c.isdigit() else int(c)
+        result += entry
+    return result if result < 255 else 200

@@ -67,9 +67,9 @@ class Kbase(object):
                reservehost=False, start=True, keys=None, cmds=[], ips=None,
                netmasks=None, gateway=None, nested=True, dns=None, domain=None,
                tunnel=False, files=[], enableroot=True, alias=[], overrides={},
-               tags=[], dnsclient=None, storemetadata=False, sharedfolders=[], kernel=None, initrd=None,
-               cmdline=None, cpuhotplug=False, memoryhotplug=False, numamode=None, numa=[], pcidevices=[], tpm=False,
-               placement=[], autostart=False, rng=False, kube=None, kubetype=None):
+               tags=[], storemetadata=False, sharedfolders=[], kernel=None, initrd=None, cmdline=None,
+               cpuhotplug=False, memoryhotplug=False, numamode=None, numa=[], pcidevices=[], tpm=False,
+               placement=[], autostart=False, rng=False, metadata={}):
         """
 
         :param name:
@@ -426,32 +426,6 @@ class Kbase(object):
 
         :param name:
         :param interface:
-        :return:
-        """
-        print("not implemented")
-        return
-
-# should leverage if possible
-# should return a sshcommand string
-# u, ip = common._ssh_credentials(self, name)
-# sshcommand = common.ssh(name, ip=ip, host=self.host, port=self.port,
-# hostuser=self.user, user=u, local=local,
-# remote=remote, tunnel=tunnel, insecure=insecure, cmd=cmd, X=X,
-# debug=self.debug)
-    def ssh(self, name, user=None, local=None, remote=None, tunnel=False, tunnelhost=None, tunnelport=22,
-            tunneluser='root', insecure=False, cmd=None, X=False, Y=False, D=None):
-        """
-
-        :param name:
-        :param user:
-        :param local:
-        :param remote:
-        :param tunnel:
-        :param insecure:
-        :param cmd:
-        :param X:
-        :param Y:
-        :param D:
         :return:
         """
         print("not implemented")

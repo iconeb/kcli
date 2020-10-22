@@ -1,5 +1,13 @@
+{%- if zerotier_nets %}
+{% set ztier = zerotier_nets %}
+{%- elif config_zerotier is defined %}
+{% set ztier = config_zerotier %}
+{%- else %}
+{% set ztier = [] %}
+{%- endif %}
+
 {{ image }}:
- type: image
+  type: image
 
 {%- if masters > 1 and config_type in ['aws', 'gcp'] %}
 {{ cluster }}-master:
@@ -41,10 +49,8 @@
  pool: {{ pool }}
  numcpus: {{ master_numcpus | default(numcpus, numcpus) }}
  memory: {{ master_memory | default(memory, memory) }}
-{%- if masters > 1 %}
- sharedkey: true
-{%- endif %}
  domain: {{ domain }}
+ zerotier_nets: {{ ztier }}
 {%- if number == 0 %}
  notify: {{ notify }}
  notifycmd: {{ notifycmd }}
@@ -58,29 +64,22 @@
   - metal_lb.sh
   - metal_lb_cm.yml
 {%- endif %}
-{%- if config_type == 'ovirt' %}
-  - ovirt_fix.sh
-{%- endif %}
 {%- if nfs %}
   - nfs.yml
   - nfs.sh
 {%- endif %}
-{%- if multus %}
-  - multus.yml
-  - cni-plugins.yml
-  - l2-bridge.yml
-{%- endif %}
 {%- endif %}
  scripts: 
-{%- if ubuntu %}
+{%- if ubuntu|default(False) %}
   - pre_ubuntu.sh
 {%- else %}
   - pre_el.sh
 {%- endif %}
-{%- if masters > 1 and config_type not in ['aws', 'gcp'] %}
-  - keepalived.sh
+{%- if config_type not in ['aws', 'gcp'] %}
+  - apache.sh
 {%- endif %}
 {%- if number == 0 %}
+  - keepalived.sh
   - masters.sh
 {%- if multus %}
   - multus.sh
@@ -90,6 +89,7 @@
 {%- endif %}
 {% else %}
   - masters_extra.sh
+  - keepalived.sh
 {% endif %}
 {%- if numa != None %}
  numa: {{ numa }}

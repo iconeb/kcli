@@ -106,6 +106,10 @@ message vminfo{
     string loadbalancer = 26 ; 
     string error = 27 ; 
     string owner = 28 ;
+    string id = 29 ;
+    string project = 30 ;
+    string domain = 31 ;
+    string iso = 32 ;
 }
 
 message vmlist{

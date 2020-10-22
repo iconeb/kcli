@@ -7,6 +7,7 @@ Openstack Provider Class
 from distutils.spawn import find_executable
 from netaddr import IPNetwork
 from kvirt import common
+from kvirt.defaults import METADATA_FIELDS
 from keystoneauth1 import loading
 from keystoneauth1 import session
 from glanceclient import Client as glanceclient
@@ -16,6 +17,7 @@ from neutronclient.v2_0.client import Client as neutronclient
 import os
 from time import sleep
 import webbrowser
+from ipaddress import ip_address, ip_network
 
 
 class Kopenstack(object):
@@ -23,19 +25,23 @@ class Kopenstack(object):
 
     """
     def __init__(self, host='127.0.0.1', version='2', port=None, user='root', password=None, debug=False, project=None,
-                 domain='Default', auth_url=None, ca_file=None):
+                 domain='Default', auth_url=None, ca_file=None, external_network=None):
         self.debug = debug
         self.host = host
         loader = loading.get_plugin_loader('password')
         auth = loader.load_from_options(auth_url=auth_url, username=user, password=password, project_name=project,
                                         user_domain_name=domain, project_domain_name=domain)
-        sess = session.Session(auth=auth, verify=ca_file)
+        if ca_file is not None:
+            sess = session.Session(auth=auth, verify=os.path.expanduser(ca_file))
+        else:
+            sess = session.Session(auth=auth)
         self.nova = novaclient.Client(version, session=sess)
         self.glance = glanceclient(version, session=sess)
         self.cinder = cinderclient.Client(version, session=sess)
         self.neutron = neutronclient(session=sess)
         self.conn = self.nova
         self.project = project
+        self.external_network = external_network
         return
 
 # should cleanly close your connection, if needed
@@ -65,9 +71,9 @@ class Kopenstack(object):
                reservehost=False, start=True, keys=None, cmds=[], ips=None,
                netmasks=None, gateway=None, nested=True, dns=None, domain=None,
                tunnel=False, files=[], enableroot=True, alias=[], overrides={},
-               tags={}, dnsclient=None, storemetadata=False, sharedfolders=[], kernel=None, initrd=None,
+               tags={}, storemetadata=False, sharedfolders=[], kernel=None, initrd=None,
                cmdline=None, placement=[], autostart=False, cpuhotplug=False, memoryhotplug=False, numamode=None,
-               numa=[], pcidevices=[], tpm=False, rng=False, kube=None, kubetype=None):
+               numa=[], pcidevices=[], tpm=False, rng=False, metadata={}):
         glance = self.glance
         nova = self.nova
         neutron = self.neutron
@@ -87,6 +93,7 @@ class Kopenstack(object):
         else:
             flavor = nova.flavors.find(name=flavor)
         nics = []
+        need_floating = True
         for net in nets:
             if isinstance(net, str):
                 netname = net
@@ -94,13 +101,14 @@ class Kopenstack(object):
                 netname = net['name']
             try:
                 net = nova.neutron.find_network(name=netname)
+                if net.to_dict()['router:external']:
+                    need_floating = False
             except Exception as e:
                 common.pprint(e, color='red')
                 return {'result': 'failure', 'reason': "Network %s not found" % netname}
             nics.append({'net-id': net.id})
-        image = None
         if image is not None:
-            glanceimages = [img for img in glance.images.list() if img == image]
+            glanceimages = [img for img in glance.images.list() if img.name == image]
             if glanceimages:
                 glanceimage = glanceimages[0]
             else:
@@ -148,14 +156,6 @@ class Kopenstack(object):
         else:
             common.pprint('Couldnt locate or create keypair for use. Leaving...', color='red')
             return {'result': 'failure', 'reason': "No usable keypair found"}
-        meta = {'plan': plan, 'profile': profile}
-        if dnsclient is not None:
-            meta['dnsclient'] = dnsclient
-        if domain is not None:
-            meta['domain'] = domain
-        if kube is not None and kubetype is not None:
-            meta['kube'] = kube
-            meta['kubetype'] = kubetype
         userdata = None
         if cloudinit:
             if image is not None and common.needs_ignition(image):
@@ -164,54 +164,59 @@ class Kopenstack(object):
                                            domain=domain, reserveip=reserveip, files=files, enableroot=enableroot,
                                            overrides=overrides, version=version, plan=plan, image=image)
             else:
-                common.cloudinit(name=name, keys=keys, cmds=cmds, nets=nets, gateway=gateway, dns=dns, domain=domain,
-                                 reserveip=reserveip, files=files, enableroot=enableroot, overrides=overrides,
-                                 iso=False, storemetadata=storemetadata)
-                userdata = open('/tmp/user-data', 'r').read().strip()
+                userdata = common.cloudinit(name=name, keys=keys, cmds=cmds, nets=nets, gateway=gateway, dns=dns,
+                                            domain=domain, reserveip=reserveip, files=files, enableroot=enableroot,
+                                            overrides=overrides, storemetadata=storemetadata)[0]
+        meta = {x: metadata[x] for x in metadata if x in METADATA_FIELDS}
         instance = nova.servers.create(name=name, image=glanceimage, flavor=flavor, key_name=key_name, nics=nics,
                                        meta=meta, userdata=userdata, block_device_mapping=block_dev_mapping)
         tenant_id = instance.tenant_id
-        floating_ips = [f['id'] for f in neutron.list_floatingips()['floatingips']
-                        if f['port_id'] is None]
-        if not floating_ips:
-            network_id = None
-            networks = [n for n in neutron.list_networks()['networks'] if n['router:external']]
-            if networks:
-                network_id = networks[0]['id']
-            if network_id is not None and tenant_id is not None:
-                args = dict(floating_network_id=network_id, tenant_id=tenant_id)
-                floating_ip = neutron.create_floatingip(body={'floatingip': args})
-                floatingip_id = floating_ip['floatingip']['id']
-                floatingip_ip = floating_ip['floatingip']['floating_ip_address']
-                common.pprint('Assigning new floating ip %s for this vm' % floatingip_ip)
-        else:
-            floatingip_id = floating_ips[0]
-        fixed_ip = None
-        timeout = 0
-        while fixed_ip is None:
-            common.pprint("Waiting 5 seconds for vm to get an ip")
-            sleep(5)
-            timeout += 5
-            if timeout >= 80:
-                common.pprint("Time out waiting for vm to get an ip", color='red')
-                break
-            vm = nova.servers.get(instance.id)
-            if vm.status.lower() == 'error':
-                msg = "Vm reports error status"
-                return {'result': 'failure', 'reason': msg}
-            for key in list(vm.addresses):
-                entry1 = vm.addresses[key]
-                for entry2 in entry1:
-                    if entry2['OS-EXT-IPS:type'] == 'fixed':
-                        fixed_ip = entry2['addr']
-                        break
-        if fixed_ip is not None:
-            fixedports = [i['id'] for i in neutron.list_ports()['ports']
-                          if i['fixed_ips'] and i['fixed_ips'][0]['ip_address'] == fixed_ip]
-            port_id = fixedports[0]
-            neutron.update_floatingip(floatingip_id, {'floatingip': {'port_id': port_id}})
-        securitygroups = [s for s in neutron.list_security_groups()['security_groups']
-                          if s['name'] == 'default' and s['tenant_id'] == tenant_id]
+        if need_floating:
+            floating_ips = [f['id'] for f in neutron.list_floatingips()['floatingips']
+                            if f['port_id'] is None]
+            if not floating_ips:
+                network_id = None
+                if self.external_network is not None:
+                    networks = [n for n in neutron.list_networks()['networks'] if n['router:external']
+                                if n['name'] == self.external_network]
+                else:
+                    networks = [n for n in neutron.list_networks()['networks'] if n['router:external']]
+                if networks:
+                    network_id = networks[0]['id']
+                if network_id is not None and tenant_id is not None:
+                    args = dict(floating_network_id=network_id, tenant_id=tenant_id)
+                    floating_ip = neutron.create_floatingip(body={'floatingip': args})
+                    floatingip_id = floating_ip['floatingip']['id']
+                    floatingip_ip = floating_ip['floatingip']['floating_ip_address']
+                    common.pprint('Assigning new floating ip %s for this vm' % floatingip_ip)
+            else:
+                floatingip_id = floating_ips[0]
+            fixed_ip = None
+            timeout = 0
+            while fixed_ip is None:
+                common.pprint("Waiting 5 seconds for vm to get an ip")
+                sleep(5)
+                timeout += 5
+                if timeout >= 80:
+                    common.pprint("Time out waiting for vm to get an ip", color='red')
+                    break
+                vm = nova.servers.get(instance.id)
+                if vm.status.lower() == 'error':
+                    msg = "Vm reports error status"
+                    return {'result': 'failure', 'reason': msg}
+                for key in list(vm.addresses):
+                    entry1 = vm.addresses[key]
+                    for entry2 in entry1:
+                        if entry2['OS-EXT-IPS:type'] == 'fixed':
+                            fixed_ip = entry2['addr']
+                            break
+            if fixed_ip is not None:
+                fixedports = [i['id'] for i in neutron.list_ports()['ports']
+                              if i['fixed_ips'] and i['fixed_ips'][0]['ip_address'] == fixed_ip]
+                port_id = fixedports[0]
+                neutron.update_floatingip(floatingip_id, {'floatingip': {'port_id': port_id}})
+            securitygroups = [s for s in neutron.list_security_groups()['security_groups']
+                              if s['name'] == 'default' and s['tenant_id'] == tenant_id]
         if securitygroups:
             securitygroup = securitygroups[0]
             securitygroupid = securitygroup['id']
@@ -340,7 +345,14 @@ class Kopenstack(object):
                 yamlinfo['error'] = vm.fault['message']
             except:
                 pass
-        source = self.glance.images.get(vm.image['id']).name if 'id' in vm.image else ''
+
+        source = ''
+        if 'id' in vm.image:
+            source = vm.image['id']
+            try:
+                source = self.glance.images.get(vm.image['id']).name
+            except:
+                pass
         yamlinfo['image'] = source
         yamlinfo['user'] = common.get_user(source)
         flavor = nova.flavors.get(vm.flavor['id'])
@@ -361,7 +373,7 @@ class Kopenstack(object):
                         yamlinfo['privateip'] = entry2['addr']
                     yamlinfo['nets'].append(net)
                     index += 1
-        if 'ip' not in yamlinfo:
+        if 'ip' not in yamlinfo and 'privateip' in yamlinfo:
             yamlinfo['ip'] = yamlinfo['privateip']
         disks = []
         for disk in vm._info['os-extended-volumes:volumes_attached']:
@@ -374,17 +386,10 @@ class Kopenstack(object):
             yamlinfo['disks'] = disks
         metadata = vm.metadata
         if metadata is not None:
-            if 'plan' in metadata:
-                yamlinfo['plan'] = metadata['plan']
-            if 'kube' in metadata and 'kubetype' in metadata:
-                yamlinfo['kube'] = metadata['kube']
-                yamlinfo['kubetype'] = metadata['kubetype']
-            if 'profile' in metadata:
-                yamlinfo['profile'] = metadata['profile']
-            if 'loadbalancer' in metadata:
-                yamlinfo['loadbalancer'] = metadata['loadbalancer']
+            for entry in metadata:
+                yamlinfo[entry] = metadata[entry]
         if debug:
-            yamlinfo['debug'] = vars(vm)
+            yamlinfo['debug'] = str(vars(vm))
         return yamlinfo
 
     def ip(self, name):
@@ -395,8 +400,8 @@ class Kopenstack(object):
         glanceimages = []
         glance = self.glance
         for img in glance.images.list():
-            glanceimages.append(img)
-        return glanceimages
+            glanceimages.append(img.name)
+        return sorted(glanceimages)
 
     def delete(self, name, snapshots=False):
         cinder = self.cinder
@@ -416,7 +421,10 @@ class Kopenstack(object):
         vm.delete()
         for floating in vm_floating_ips:
             floatingid = floating_ips[floating]
-            self.neutron.delete_floatingip(floatingid)
+            try:
+                self.neutron.delete_floatingip(floatingid)
+            except Exception as e:
+                common.pprint("Hit %s when tying to delete floating %s" % (str(e), floating))
         index = 0
         for disk in vm._info['os-extended-volumes:volumes_attached']:
             volume = cinder.volumes.get(disk['id'])
@@ -636,32 +644,6 @@ class Kopenstack(object):
         print("not implemented")
         return
 
-    def ssh(self, name, user=None, local=None, remote=None, tunnel=False, tunnelhost=None, tunnelport=22,
-            tunneluser='root', insecure=False, cmd=None, X=False, Y=False, D=None):
-        u, ip = common._ssh_credentials(self, name)
-        if user is None:
-            user = u
-        tunnel = False
-        sshcommand = common.ssh(name, ip=ip, user=user, local=local, remote=remote,
-                                tunnel=tunnel, tunnelhost=tunnelhost, tunnelport=tunnelport, tunneluser=tunneluser,
-                                insecure=insecure, cmd=cmd, X=X, Y=Y, debug=self.debug)
-        if self.debug:
-            print(sshcommand)
-        return sshcommand
-
-    def scp(self, name, user=None, source=None, destination=None, tunnel=False, tunnelhost=None, tunnelport=22,
-            tunneluser='root', download=False, recursive=False, insecure=False):
-        u, ip = common._ssh_credentials(self, name)
-        if user is None:
-            user = u
-        scpcommand = common.scp(name, ip=ip, user=user, source=source,
-                                destination=destination, recursive=recursive, tunnel=tunnel, tunnelhost=tunnelhost,
-                                tunnelport=tunnelport, tunneluser=tunneluser, debug=self.debug, download=download,
-                                insecure=insecure)
-        if self.debug:
-            print(scpcommand)
-        return scpcommand
-
     def create_pool(self, name, poolpath, pooltype='dir', user='qemu', thinpool=None):
         print("not implemented")
         return
@@ -880,3 +862,59 @@ class Kopenstack(object):
 
     def list_dns(self, domain):
         return []
+
+    def create_network_port(self, name, network, ip=None, floating=False, security=True):
+        neutron = self.neutron
+        matchingports = [i for i in neutron.list_ports()['ports'] if i['name'] == name]
+        if matchingports:
+            msg = "Port %s already exists" % name
+            common.pprint(msg, color='blue')
+            return {'result': 'success'}
+        networks = [net for net in neutron.list_networks()['networks'] if net['name'] == network]
+        if not networks:
+            msg = "Network %s not found" % network
+            common.pprint(msg, color='red')
+            return {'result': 'failure', 'reason': msg}
+        else:
+            network = networks[0]
+        network_id = network['id']
+        port = {'name': name, "admin_state_up": True, "network_id": network_id, 'port_security_enabled': security}
+        if ip is not None:
+            for subnet in neutron.list_subnets()['subnets']:
+                subnet_name = subnet['name']
+                subnet_id = subnet['id']
+                cidr = subnet['cidr']
+                if network_id == subnet['network_id'] and ip_address(ip) in ip_network(cidr):
+                    msg = "Using matching subnet %s with cidr %s" % (subnet_name, cidr)
+                    common.pprint(msg, color='blue')
+                    port['fixed_ips'] = [{'ip_address': ip, 'subnet_id': subnet_id}]
+        result = neutron.create_port({'port': port})
+        port_id = result['port']['id']
+        if floating:
+            tenant_id = network['tenant_id']
+            if self.external_network is not None:
+                network_id = self.external_network
+                external_networks = [n for n in neutron.list_networks()['networks'] if n['router:external']
+                                     if n['name'] == self.external_network]
+            else:
+                external_networks = [n for n in neutron.list_networks()['networks'] if n['router:external']]
+            if external_networks:
+                network_id = external_networks[0]['id']
+            else:
+                msg = "No valid external network found for floating ips"
+                common.pprint(msg, color='red')
+                return {'result': 'failure', 'reason': msg}
+            args = dict(floating_network_id=network_id, tenant_id=tenant_id, port_id=port_id)
+            floating_ip = neutron.create_floatingip(body={'floatingip': args})
+            floatingip_ip = floating_ip['floatingip']['floating_ip_address']
+            common.pprint('Assigning new floating ip %s for this port' % floatingip_ip)
+        return {'result': 'success'}
+
+    def delete_network_port(self, name, network=None, floating=False):
+        neutron = self.neutron
+        matchingports = [i for i in neutron.list_ports()['ports'] if i['name'] == name]
+        if not matchingports:
+            msg = "Port %s not found" % name
+            common.pprint(msg, color='red')
+            return {'result': 'failure', 'reason': msg}
+        self.neutron.delete_port(matchingports[0]['id'])

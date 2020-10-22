@@ -6,6 +6,7 @@ Aws Provider Class
 
 from datetime import datetime
 from kvirt import common
+from kvirt.default import METADATA_FIELDS
 import boto3
 from netaddr import IPNetwork
 import os
@@ -68,10 +69,10 @@ class Kaws(object):
                disks=[{'size': 10}], disksize=10, diskthin=True, diskinterface='virtio', nets=['default'], iso=None,
                vnc=False, cloudinit=True, reserveip=False, reservedns=False, reservehost=False, start=True, keys=None,
                cmds=[], ips=None, netmasks=None, gateway=None, nested=True, dns=None, domain=None, tunnel=False,
-               files=[], enableroot=True, alias=[], overrides={}, tags=[], dnsclient=None, storemetadata=False,
+               files=[], enableroot=True, alias=[], overrides={}, tags=[], storemetadata=False,
                sharedfolders=[], kernel=None, initrd=None, cmdline=None, placement=[], autostart=False,
                cpuhotplug=False, memoryhotplug=False, numamode=None, numa=[], pcidevices=[], tpm=False, rng=False,
-               kube=None, kubetype=None):
+               metadata={}):
         conn = self.conn
         if self.exists(name):
             return {'result': 'failure', 'reason': "VM %s already exists" % name}
@@ -96,11 +97,9 @@ class Kaws(object):
             else:
                 return {'result': 'failure', 'reason': 'Couldnt find instance type matching requirements'}
         vmtags = [{'ResourceType': 'instance',
-                   'Tags': [{'Key': 'Name', 'Value': name}, {'Key': 'plan', 'Value': plan},
-                            {'Key': 'hostname', 'Value': name}, {'Key': 'profile', 'Value': profile}]}]
-        if kube is not None and kubetype is not None:
-            vmtags[0]['Tags'].append({'Key': 'kube', 'Value': kube})
-            vmtags[0]['Tags'].append({'Key': 'kubetype', 'Value': kubetype})
+                   'Tags': [{'Key': 'Name', 'Value': name}, {'Key': 'hostname', 'Value': name}]}]
+        for entry in [field for field in metadata if field in METADATA_FIELDS]:
+            vmtags[0]['Tags'].append({'Key': entry, 'Value': metadata[entry]})
         if keypair is None:
             keypair = 'kvirt_%s' % self.access_key_id
         keypairs = [k for k in conn.describe_key_pairs()['KeyPairs'] if k['KeyName'] == keypair]
@@ -128,10 +127,9 @@ class Kaws(object):
                                            domain=domain, reserveip=reserveip, files=files, enableroot=enableroot,
                                            overrides=overrides, version=version, plan=plan, image=image)
             else:
-                common.cloudinit(name=name, keys=keys, cmds=cmds, nets=nets, gateway=gateway, dns=dns, domain=domain,
-                                 reserveip=reserveip, files=files, enableroot=enableroot, overrides=overrides,
-                                 iso=False, fqdn=True, storemetadata=storemetadata)
-                userdata = open('/tmp/user-data', 'r').read()
+                userdata = common.cloudinit(name=name, keys=keys, cmds=cmds, nets=nets, gateway=gateway, dns=dns,
+                                            domain=domain, reserveip=reserveip, files=files, enableroot=enableroot,
+                                            overrides=overrides, fqdn=True, storemetadata=storemetadata)[0]
         else:
             userdata = ''
         networkinterfaces = []
@@ -191,10 +189,6 @@ class Kaws(object):
                 blockdevicemapping['Ebs']['VolumeType'] = disk.get('type', 'standard')
             blockdevicemapping['Ebs']['VolumeSize'] = disksize
             blockdevicemappings.append(blockdevicemapping)
-        if reservedns and domain is not None:
-            vmtags[0]['Tags'].append({'Key': 'domain', 'Value': domain})
-        if dnsclient is not None:
-            vmtags[0]['Tags'].append({'Key': 'dnsclient', 'Value': dnsclient})
         SecurityGroupIds = []
         for tag in tags:
             sgid = self.get_security_group_id(tag, vpcid)
@@ -364,29 +358,10 @@ class Kaws(object):
         image = resource.Image(amid)
         source = os.path.basename(image.image_location)
         plan = ''
-        kube = None
-        kubetype = None
         profile = ''
-        loadbalancer = None
         if 'Tags' in vm:
             for tag in vm['Tags']:
-                if tag['Key'] == 'plan':
-                    plan = tag['Value']
-                if tag['Key'] == 'kube':
-                    kube = tag['Value']
-                if tag['Key'] == 'kubetype':
-                    kubetype = tag['Value']
-                if tag['Key'] == 'profile':
-                    profile = tag['Value']
-                if tag['Key'] == 'Name':
-                    name = tag['Value']
-                if tag['Key'] == 'loadbalancer':
-                    loadbalancer = tag['Value']
-        if loadbalancer is not None:
-            yamlinfo['loadbalancer'] = loadbalancer
-        if kube is not None and kubetype is not None:
-            yamlinfo['kube'] = kube
-            yamlinfo['kubetype'] = kubetype
+                yamlinfo[tag['Key']] = tag['Value']
         yamlinfo['name'] = name
         yamlinfo['status'] = state
         yamlinfo['az'] = az
@@ -655,29 +630,6 @@ class Kaws(object):
     def delete_nic(self, name, interface):
         print("not implemented")
         return
-
-    def ssh(self, name, user=None, local=None, remote=None, tunnel=False, tunnelhost=None, tunnelport=22,
-            tunneluser='root', insecure=False, cmd=None, X=False, Y=False, D=None):
-        u, ip = common._ssh_credentials(self, name)
-        if user is None:
-            user = u
-        sshcommand = common.ssh(name, ip=ip, user=user, local=local, remote=remote, tunnel=tunnel,
-                                tunnelhost=tunnelhost, tunnelport=tunnelport, tunneluser=tunneluser, insecure=insecure,
-                                cmd=cmd, X=X, Y=Y, D=D, debug=self.debug)
-        return sshcommand
-
-    def scp(self, name, user=None, source=None, destination=None, tunnel=False, tunnelhost=None, tunnelport=22,
-            tunneluser='root', download=False, recursive=False,
-            insecure=False):
-        u, ip = common._ssh_credentials(self, name)
-        if ip is None:
-            return None
-        if user is None:
-            user = u
-        scpcommand = common.scp(name, ip=ip, user=user, source=source, destination=destination, recursive=recursive,
-                                tunnel=tunnel, tunnelhost=tunnelhost, tunnelport=tunnelport, tunneluser=tunneluser,
-                                debug=self.debug, download=download, insecure=insecure)
-        return scpcommand
 
     def create_pool(self, name, poolpath, pooltype='dir', user='qemu', thinpool=None):
         print("not implemented")

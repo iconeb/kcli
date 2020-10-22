@@ -22,11 +22,44 @@ from kvirt.containerconfig import Kcontainerconfig
 from distutils.spawn import find_executable
 import glob
 import os
+import re
 from shutil import rmtree
 import sys
 from time import sleep
 import webbrowser
 import yaml
+
+zerotier_service = """[Unit]
+Description=Zero Tier service
+After=network-online.target
+Wants=network-online.target
+Before=kubelet.service
+[Service]
+Type=forking
+KillMode=none
+Restart=on-failure
+RemainAfterExit=yes
+ExecStartPre=modprobe tun
+ExecStartPre=podman pull docker.io/karmab/zerotier-cli
+ExecStartPre=podman create --name=zerotier -it --cap-add=NET_ADMIN --device=/dev/net/tun --cap-add=SYS_ADMIN \
+--net=host --entrypoint=/bin/sh karmab/zerotier-cli -c "zerotier-one -d ; sleep 10 ; \
+{zerotier_join} ; \
+sleep infinity"
+ExecStart=podman start zerotier
+ExecStop=podman stop -t 10 zerotier
+ExecStopPost=podman rm zerotier
+{zerotier_kubelet_script}
+[Install]
+WantedBy=multi-user.target"""
+
+
+zerotier_kubelet_data = """ExecStartPost=/bin/bash -c 'sleep 20 ;\
+IP=$(ip -4 -o addr show ztppiqixar | cut -f7 -d" " | cut -d "/" -f 1 | head -1) ;\
+if [ "$(grep $IP /etc/systemd/system/kubelet.service)" == "" ] ; then \
+sed -i "/node-ip/d" /etc/systemd/system/kubelet.service ;\
+sed -i "/.*node-labels*/a --node-ip=$IP --address=$IP \\" /etc/systemd/system/kubelet.service ;\
+systemctl daemon-reload ;\
+fi'"""
 
 
 class Kconfig(Kbaseconfig):
@@ -43,7 +76,6 @@ class Kconfig(Kbaseconfig):
                 context = self.options.get('context')
                 cdi = self.options.get('cdi', True)
                 datavolumes = self.options.get('cdi', True)
-                multus = self.options.get('multus', True)
                 readwritemany = self.options.get('readwritemany', False)
                 ca_file = self.options.get('ca_file')
                 if ca_file is not None:
@@ -61,7 +93,7 @@ class Kconfig(Kbaseconfig):
                     else:
                         token = open(token_file).read()
                 from kvirt.providers.kubevirt import Kubevirt
-                k = Kubevirt(context=context, token=token, ca_file=ca_file, multus=multus, host=self.host,
+                k = Kubevirt(context=context, token=token, ca_file=ca_file, host=self.host,
                              port=self.port, user=self.user, debug=debug, namespace=namespace, cdi=cdi,
                              datavolumes=datavolumes, readwritemany=readwritemany)
                 self.host = k.host
@@ -147,17 +179,19 @@ class Kconfig(Kbaseconfig):
                                              os.environ.get("OS_PASSWORD")] if e is not None), None)
                 ca_file = next((e for e in [self.options.get('ca_file'),
                                             os.environ.get("OS_CACERT")] if e is not None), None)
+                external_network = self.options.get('external_network')
                 if password is None:
                     common.pprint("Missing password in the configuration. Leaving", color='red')
                     os._exit(1)
                 if auth_url.endswith('v2.0'):
                     domain = None
-                if auth_url.startswith('https') and ca_file is None:
-                    common.pprint("Secure auth_url was specified and ca_file is missing. Leaving", color='red')
-                    os.exit(1)
+                if ca_file is not None and not os.path.exists(os.path.expanduser(ca_file)):
+                    common.pprint("Indicated ca_file %s not found. Leaving" % ca_file, color='red')
+                    os._exit(1)
                 from kvirt.providers.openstack import Kopenstack
                 k = Kopenstack(host=self.host, port=self.port, user=user, password=password, version=version,
-                               debug=debug, project=project, domain=domain, auth_url=auth_url, ca_file=ca_file)
+                               debug=debug, project=project, domain=domain, auth_url=auth_url, ca_file=ca_file,
+                               external_network=external_network)
             elif self.type == 'vsphere':
                 user = self.options.get('user')
                 if user is None:
@@ -221,7 +255,7 @@ class Kconfig(Kbaseconfig):
         self.overrides.update(config_data)
 
     def create_vm(self, name, profile, overrides={}, customprofile={}, k=None,
-                  plan='kvirt', basedir='.', client=None, onfly=None, wait=False, planmode=False):
+                  plan='kvirt', basedir='.', client=None, onfly=None, wait=False, onlyassets=False):
         """
 
         :param k:
@@ -259,7 +293,8 @@ class Kconfig(Kbaseconfig):
                     self.handle_host(pool=self.pool, image=customprofileimage, download=True, update_profile=True)
                     vmprofiles[profile]['image'] = os.path.basename(IMAGES[customprofileimage])
         else:
-            common.pprint("Deploying vm %s from profile %s..." % (name, profile))
+            if not onlyassets:
+                common.pprint("Deploying vm %s from profile %s..." % (name, profile))
         if profile not in vmprofiles:
             clientprofile = "%s_%s" % (self.client, profile)
             if clientprofile in vmprofiles and 'image' in vmprofiles[clientprofile]:
@@ -270,14 +305,13 @@ class Kconfig(Kbaseconfig):
                 self.handle_host(pool=self.pool, image=profile, download=True, update_profile=True)
                 vmprofiles[profile] = {'image': os.path.basename(IMAGES[profile])}
             else:
-                common.pprint("Profile %s not found. Using the image as profile..." % profile, color='blue')
+                if not onlyassets:
+                    common.pprint("Profile %s not found. Using the image as profile..." % profile, color='blue')
                 vmprofiles[profile] = {'image': profile}
         profilename = profile
         profile = vmprofiles[profile]
-        if not planmode:
-            for key in overrides:
-                if key not in profile:
-                    profile[key] = overrides[key]
+        if not customprofile:
+            profile.update(overrides)
         if 'base' in profile:
             father = vmprofiles[profile['base']]
             default_numcpus = father.get('numcpus', self.numcpus)
@@ -310,13 +344,13 @@ class Kconfig(Kbaseconfig):
             default_files = father.get('files', self.files)
             default_enableroot = father.get('enableroot', self.enableroot)
             default_privatekey = father.get('privatekey', self.privatekey)
+            default_networkwait = father.get('networkwait', self.networkwait)
             default_rhnregister = father.get('rhnregister', self.rhnregister)
             default_rhnuser = father.get('rhnuser', self.rhnuser)
             default_rhnpassword = father.get('rhnpassword', self.rhnpassword)
             default_rhnak = father.get('rhnactivationkey', self.rhnak)
             default_rhnorg = father.get('rhnorg', self.rhnorg)
             default_rhnpool = father.get('rhnpool', self.rhnpool)
-            default_rhnwait = father.get('rhnwait', self.rhnwait)
             default_tags = father.get('tags', self.tags)
             default_flavor = father.get('flavor', self.flavor)
             default_cmds = common.remove_duplicates(self.cmds + father.get('cmds', []))
@@ -347,7 +381,8 @@ class Kconfig(Kbaseconfig):
             default_pcidevices = father.get('pcidevices', self.pcidevices)
             default_tpm = father.get('tpm', self.tpm)
             default_rng = father.get('rng', self.rng)
-            default_zerotier = father.get('zerotier', self.zerotier)
+            default_zerotier_nets = father.get('zerotier_nets', self.zerotier_nets)
+            default_zerotier_kubelet = father.get('zerotier_kubelet', self.zerotier_kubelet)
             default_virttype = father.get('virttype', self.virttype)
         else:
             default_numcpus = self.numcpus
@@ -368,7 +403,8 @@ class Kconfig(Kbaseconfig):
             default_pcidevices = self.pcidevices
             default_tpm = self.tpm
             default_rng = self.rng
-            default_zerotier = self.zerotier
+            default_zerotier_nets = self.zerotier_nets
+            default_zerotier_kubelet = self.zerotier_kubelet
             default_disksize = self.disksize
             default_diskinterface = self.diskinterface
             default_diskthin = self.diskthin
@@ -388,13 +424,13 @@ class Kconfig(Kbaseconfig):
             default_tags = self.tags
             default_flavor = self.flavor
             default_privatekey = self.privatekey
+            default_networkwait = self.networkwait
             default_rhnregister = self.rhnregister
             default_rhnuser = self.rhnuser
             default_rhnpassword = self.rhnpassword
             default_rhnak = self.rhnak
             default_rhnorg = self.rhnorg
             default_rhnpool = self.rhnpool
-            default_rhnwait = self.rhnwait
             default_cmds = self.cmds
             default_scripts = self.scripts
             default_dnsclient = self.dnsclient
@@ -430,7 +466,8 @@ class Kconfig(Kbaseconfig):
         pcidevices = profile.get('pcidevices', default_pcidevices)
         tpm = profile.get('tpm', default_tpm)
         rng = profile.get('rng', default_rng)
-        zerotier = profile.get('zerotier', default_zerotier)
+        zerotier_nets = profile.get('zerotier_nets', default_zerotier_nets)
+        zerotier_kubelet = profile.get('zerotier_kubelet', default_zerotier_kubelet)
         numcpus = profile.get('numcpus', default_numcpus)
         memory = profile.get('memory', default_memory)
         pool = profile.get('pool', default_pool)
@@ -502,13 +539,13 @@ class Kconfig(Kbaseconfig):
         if default_tags:
             tags = default_tags + tags if tags else default_tags
         privatekey = profile.get('privatekey', default_privatekey)
+        networkwait = profile.get('networkwait', default_networkwait)
         rhnregister = profile.get('rhnregister', default_rhnregister)
         rhnuser = profile.get('rhnuser', default_rhnuser)
         rhnpassword = profile.get('rhnpassword', default_rhnpassword)
         rhnak = profile.get('rhnactivationkey', default_rhnak)
         rhnorg = profile.get('rhnorg', default_rhnorg)
         rhnpool = profile.get('rhnpool', default_rhnpool)
-        rhnwait = profile.get('rhnwait', default_rhnwait)
         flavor = profile.get('flavor', default_flavor)
         dnsclient = profile.get('dnsclient', default_dnsclient)
         storemetadata = profile.get('storemetadata', default_storemetadata)
@@ -578,7 +615,7 @@ class Kconfig(Kbaseconfig):
                     if scriptlines:
                         scriptcmds.extend(scriptlines)
         if skip_rhnregister_script and cloudinit and image is not None and image.lower().startswith('rhel'):
-            rhncommands = ['sleep %s' % rhnwait] if rhnwait > 0 else []
+            rhncommands = []
             if rhnak is not None and rhnorg is not None:
                 rhncommands.append('subscription-manager register --force --activationkey=%s --org=%s'
                                    % (rhnak, rhnorg))
@@ -607,11 +644,19 @@ class Kconfig(Kbaseconfig):
         if sharedfoldercmds:
             sharedfoldercmds.append("mount -a")
         zerotiercmds = []
-        if zerotier:
-            zerotiercmds.append("curl -s https://install.zerotier.com | bash")
-            for entry in zerotier:
-                zerotiercmds.append("zerotier-cli join %s" % entry)
-        cmds = rhncommands + sharedfoldercmds + zerotiercmds + cmds + scriptcmds
+        if zerotier_nets:
+            if image is not None and common.needs_ignition(image):
+                zerotier_join = ';'.join([' zerotier-cli join %s ' % entry for entry in zerotier_nets])
+                zerotier_kubelet_script = zerotier_kubelet_data if zerotier_kubelet else ''
+                zerotiercontent = zerotier_service.format(zerotier_join=zerotier_join,
+                                                          zerotier_kubelet_script=zerotier_kubelet_script)
+                files.append({'path': '/root/zerotier.service', 'content': zerotiercontent})
+            else:
+                zerotiercmds.append("curl -s https://install.zerotier.com | bash")
+                for entry in zerotier_nets:
+                    zerotiercmds.append("zerotier-cli join %s" % entry)
+        networkwaitcommand = ['sleep %s' % networkwait] if networkwait > 0 else []
+        cmds = networkwaitcommand + rhncommands + sharedfoldercmds + zerotiercmds + cmds + scriptcmds
         if notify:
             if notifycmd is None and notifyscript is None:
                 if 'cos' in image:
@@ -704,31 +749,27 @@ $INFO
         ips = [overrides[key] for key in overrides if key.startswith('ip')]
         netmasks = [overrides[key] for key in overrides if key.startswith('netmask')]
         if privatekey:
-            privatekeyfile = None
-            if 'HOME' not in os.environ:
-                msg = "HOME env variable not set and needed for privatekey"
-                return {'result': 'failure', 'reason': msg}
-            sshdir = "%s/.ssh" % os.environ['HOME']
-            if os.path.exists("%s/id_rsa" % sshdir) and os.path.exists("%s/id_rsa.pub" % sshdir):
-                privatekeyfile = "%s/id_rsa" % sshdir
-                pubkeyfile = "%s/id_rsa.pub" % sshdir
-            elif os.path.exists("%s/id_rsa" % sshdir) and os.path.exists("%s/id_dsa.pub" % sshdir):
-                privatekeyfile = "%s/id_dsa" % sshdir
-                pubkeyfile = "%s/id_dsa.pub" % sshdir
-            if privatekeyfile is not None:
+            privatekeyfile, publickeyfile = None, None
+            for path in ["~/.kcli/id_rsa", "~/.kcli/id_dsa", "~/.ssh/id_rsa", "~/.ssh/id_dsa"]:
+                expanded_path = os.path.expanduser(path)
+                if os.path.exists(expanded_path) and os.path.exists(expanded_path + ".pub"):
+                    privatekeyfile = expanded_path
+                    publickeyfile = expanded_path + ".pub"
+                    break
+            if privatekeyfile is not None and publickeyfile is not None:
                 privatekey = open(privatekeyfile).read().strip()
-                pubkey = open(pubkeyfile).read().strip()
+                publickey = open(publickeyfile).read().strip()
                 if files:
                     files.append({'path': '/root/.ssh/id_rsa', 'content': privatekey})
-                    files.append({'path': '/root/.ssh/id_rsa.pub', 'content': pubkey})
+                    files.append({'path': '/root/.ssh/id_rsa.pub', 'content': publickey})
                 else:
                     files = [{'path': '/root/.ssh/id_rsa', 'content': privatekey}]
-                    files = [{'path': '/root/.ssh/id_rsa.pub', 'content': pubkey}]
+                    files = [{'path': '/root/.ssh/id_rsa.pub', 'content': publickey}]
         if cmds and 'reboot' in cmds:
             while 'reboot' in cmds:
                 cmds.remove('reboot')
             cmds.append('reboot')
-        if image is not None and ('rhel-8' in image or 'rhcos' in image) and disks:
+        if image is not None and ('rhel-8' in image or 'rhcos' in image) and disks and not onlyassets:
             firstdisk = disks[0]
             if isinstance(firstdisk, str) and firstdisk.isdigit():
                 firstdisk = int(firstdisk)
@@ -745,6 +786,31 @@ $INFO
             else:
                 msg = "Incorrect first disk spec"
                 return {'result': 'failure', 'reason': msg}
+        metadata = {'plan': plan, 'profile': profilename}
+        if reservedns and domain is not None:
+            metadata['domain'] = domain
+        if image is not None:
+            metadata['image'] = image
+        if dnsclient is not None:
+            metadata['dnsclient'] = dnsclient
+        if 'owner' in overrides:
+            metadata['owner'] = overrides['owner']
+        if kube is not None and kubetype is not None:
+            metadata['kubetype'] = kubetype
+            metadata['kube'] = kube
+        if onlyassets:
+            if image is not None and common.needs_ignition(image):
+                version = common.ignition_version(image)
+                minimal = overrides.get('minimal', False)
+                data = common.ignition(name=name, keys=keys, cmds=cmds, nets=nets, gateway=gateway, dns=dns,
+                                       domain=domain, reserveip=reserveip, files=files, enableroot=enableroot,
+                                       overrides=overrides, version=version, plan=plan, image=image, minimal=minimal)
+            else:
+                data = common.cloudinit(name, keys=keys, cmds=cmds, nets=nets, gateway=gateway, dns=dns,
+                                        domain=domain, reserveip=reserveip, files=files, enableroot=enableroot,
+                                        overrides=overrides, image=image, storemetadata=False)[0]
+            print(data)
+            return {'result': 'success'}
         result = k.create(name=name, virttype=virttype, plan=plan, profile=profilename, flavor=flavor,
                           cpumodel=cpumodel, cpuflags=cpuflags, cpupinning=cpupinning, numamode=numamode, numa=numa,
                           numcpus=int(numcpus), memory=int(memory), guestid=guestid, pool=pool,
@@ -753,10 +819,10 @@ $INFO
                           reserveip=bool(reserveip), reservedns=bool(reservedns), reservehost=bool(reservehost),
                           start=bool(start), keys=keys, cmds=cmds, ips=ips, netmasks=netmasks, gateway=gateway, dns=dns,
                           domain=domain, nested=bool(nested), tunnel=tunnel, files=files, enableroot=enableroot,
-                          overrides=overrides, tags=tags, dnsclient=dnsclient, storemetadata=storemetadata,
+                          overrides=overrides, tags=tags, storemetadata=storemetadata,
                           sharedfolders=sharedfolders, kernel=kernel, initrd=initrd, cmdline=cmdline,
                           placement=placement, autostart=autostart, cpuhotplug=cpuhotplug, memoryhotplug=memoryhotplug,
-                          pcidevices=pcidevices, tpm=tpm, rng=rng, kube=kube, kubetype=kubetype)
+                          pcidevices=pcidevices, tpm=tpm, rng=rng, metadata=metadata)
         if result['result'] != 'success':
             return result
         if dnsclient is not None and domain is not None:
@@ -837,8 +903,9 @@ $INFO
                 vmname = vm['name']
                 kube = vm['kube']
                 kubetype = vm['kubetype']
+                kubeplan = vm['plan']
                 if kube not in kubes:
-                    kubes[kube] = {'type': kubetype, 'vms': [vmname]}
+                    kubes[kube] = {'type': kubetype, 'plan': kubeplan, 'vms': [vmname]}
                 else:
                     kubes[kube]['vms'].append(vmname)
         for kube in kubes:
@@ -903,8 +970,8 @@ $INFO
 
     def plan(self, plan, ansible=False, url=None, path=None, autostart=False, container=False, noautostart=False,
              inputfile=None, inputstring=None, start=False, stop=False, delete=False, force=True, overrides={},
-             info=False, snapshot=False, revert=False, update=False, embedded=False, restart=False, download=False,
-             wait=False, quiet=False, doc=False):
+             info=False, snapshot=False, snapshotname=None, revert=False, update=False, embedded=False, restart=False,
+             download=False, wait=False, quiet=False, doc=False, onlyassets=False):
         """Manage plan file"""
         k = self.k
         no_overrides = not overrides
@@ -1090,13 +1157,16 @@ $INFO
             if revert:
                 common.pprint("Can't revert and snapshot plan at the same time", color='red')
                 os._exit(1)
-            common.pprint("Snapshotting vms from plan %s" % plan)
+            common.pprint("Snapshotting vms from plan %s" % plan, color='blue')
+            if snapshotname is None:
+                common.pprint("Using %s as snapshot name as None was provider" % plan, color='yellow')
+                snapshotname = plan
             for vm in sorted(k.list(), key=lambda x: x['name']):
                 name = vm['name']
                 description = vm['plan']
                 if description == plan:
                     snapshotfound = True
-                    k.snapshot(plan, name)
+                    k.snapshot(snapshotname, name)
                     common.pprint("%s snapshotted!" % name)
             if snapshotfound:
                 common.pprint("Plan %s snapshotted!" % plan)
@@ -1106,17 +1176,20 @@ $INFO
         if revert:
             revertfound = False
             common.pprint("Reverting snapshots of vms from plan %s" % plan)
+            if snapshotname is None:
+                common.pprint("Using %s as snapshot name as None was provider" % plan, color='yellow')
+                snapshotname = plan
             for vm in sorted(k.list(), key=lambda x: x['name']):
                 name = vm['name']
                 description = vm['plan']
                 if description == plan:
                     revertfound = True
-                    k.snapshot(plan, name, revert=True)
+                    k.snapshot(snapshotname, name, revert=True)
                     common.pprint("snapshot of %s reverted!" % name)
             if revertfound:
-                common.pprint("Plan %s snapshot reverted!" % plan)
+                common.pprint("Plan %s reverted with snapshot %s!" % (plan, snapshotname))
             else:
-                common.pprint("No matching vms found", color='blue')
+                common.pprint("No matching vms found", color='yellow')
             return {'result': 'success'}
         if url is not None:
             if url.startswith('/'):
@@ -1128,7 +1201,7 @@ $INFO
             onfly = os.path.dirname(url)
             path = plan if path is None else path
             if not quiet:
-                common.pprint("Retrieving specified plan from %s to %s" % (url, path))
+                common.pprint("Retrieving specified plan from %s to %s" % (url, path), color='blue')
             if os.path.exists("/i_am_a_container"):
                 path = "/workdir/%s" % path
             if not os.path.exists(path):
@@ -1356,19 +1429,23 @@ $INFO
                     continue
                 kubetype = kubeprofile.get('kubetype', 'generic')
                 overrides = kubeprofile
-                if kubetype not in ['generic', 'openshift']:
-                    common.pprint("Incorrect kubetype %s specified. skipped!" % kubetype, color='blue')
-                    continue
+                overrides['cluster'] = cluster
                 existing_masters = [v for v in currentconfig.k.list() if '%s-master' % cluster in v['name']]
                 if existing_masters:
                     common.pprint("Cluster %s found. skipped!" % cluster, color='blue')
                     continue
-                if kubetype == 'generic':
-                    currentconfig.create_kube_generic(cluster, overrides=overrides)
+                if kubetype == 'openshift':
+                    currentconfig.create_kube_openshift(plan, overrides=overrides)
+                elif kubetype == 'k3s':
+                    currentconfig.create_kube_k3s(plan, overrides=overrides)
+                elif kubetype == 'generic':
+                    currentconfig.create_kube_generic(plan, overrides=overrides)
                 else:
-                    currentconfig.create_kube_openshift(cluster, overrides=overrides)
+                    common.pprint("Incorrect kubetype %s specified. skipped!" % kubetype, color='blue')
+                    continue
         if vmentries:
-            common.pprint("Deploying Vms...")
+            if not onlyassets:
+                common.pprint("Deploying Vms...")
             vmcounter = 0
             hosts = {}
             vms_to_host = {}
@@ -1400,7 +1477,18 @@ $INFO
                             profile[key] = baseprofile[key]
                         elif key in baseprofile and key in profile and key in appendkeys:
                             profile[key] = baseprofile[key] + profile[key]
-                vmclient = profile.get('client')
+                vmclient = None
+                vmrules = profile.get('clientrules', self.clientrules)
+                if vmrules:
+                    for entry in vmrules:
+                        if len(entry) != 1:
+                            common.pprint("Wrong client rule %s" % entry, color='red')
+                            os._exit(1)
+                        rule = list(entry.keys())[0]
+                        if re.match(rule, name):
+                            vmclient = entry[rule]
+                            break
+                vmclient = profile.get('client', vmclient)
                 if vmclient is None:
                     z = k
                     vmclient = self.client
@@ -1534,6 +1622,7 @@ $INFO
                     if vmcounter >= len(vmentries):
                         os.remove("%s.key.pub" % plan)
                         os.remove("%s.key" % plan)
+                currentoverrides = overrides.copy()
                 if 'image' in profile:
                     for entry in self.list_profiles():
                         currentimage = profile['image']
@@ -1541,6 +1630,7 @@ $INFO
                         clientprofile = "%s_%s" % (self.client, currentimage)
                         if entryprofile == currentimage or entryprofile == clientprofile:
                             profile['image'] = entry[4]
+                            currentoverrides['image'] = profile['image']
                             break
                     imageprofile = profile['image']
                     if imageprofile in IMAGES and self.type != 'packet' and\
@@ -1548,9 +1638,10 @@ $INFO
                         common.pprint("Image %s not found. Downloading" % imageprofile, color='blue')
                         self.handle_host(pool=self.pool, image=imageprofile, download=True, update_profile=True)
                         profile['image'] = os.path.basename(IMAGES[imageprofile])
-                currentoverrides = overrides.copy()
+                        currentoverrides['image'] = profile['image']
                 result = self.create_vm(name, profilename, overrides=currentoverrides, customprofile=profile, k=z,
-                                        plan=plan, basedir=currentplandir, client=vmclient, onfly=onfly, planmode=True)
+                                        plan=plan, basedir=currentplandir, client=vmclient, onfly=onfly,
+                                        onlyassets=onlyassets)
                 common.handle_response(result, name, client=vmclient)
                 if result['result'] == 'success':
                     newvms.append(name)
@@ -1896,7 +1987,7 @@ $INFO
         else:
             return k.list_loadbalancers()
 
-    def wait(self, name, image=None):
+    def wait(self, name, image=None, quiet=False):
         k = self.k
         if image is None:
             image = k.info(name)['image']
@@ -1905,26 +1996,25 @@ $INFO
             cmd = 'journalctl --identifier=ignition --all --no-pager'
         else:
             cloudinitfile = common.get_cloudinitfile(image)
-            if common.is_debian(image):
-                cmd = "sudo grep -A5000 -i cloud-init %s" % cloudinitfile
-            else:
-                cmd = "sudo grep -i cloud-init %s" % cloudinitfile
-        ip = None
+            cmd = "sudo tail -n 200 %s" % cloudinitfile
+        user, ip = None, None
         while ip is None:
-            ip = k.info(name).get('ip')
+            info = k.info(name)
+            user, ip = info.get('user'), info.get('ip')
             common.pprint("Waiting for vm to be accessible...", color='blue')
             sleep(5)
         sleep(5)
         done = False
         oldoutput = ''
         while not done:
-            sshcmd = k.ssh(name, tunnel=self.tunnel, tunnelhost=self.tunnelhost, tunnelport=self.tunnelport,
-                           tunneluser=self.tunneluser, insecure=self.insecure, cmd=cmd)
+            sshcmd = common.ssh(name, user=user, ip=ip, tunnel=self.tunnel, tunnelhost=self.tunnelhost,
+                                tunnelport=self.tunnelport, tunneluser=self.tunneluser, insecure=self.insecure, cmd=cmd)
             output = os.popen(sshcmd).read()
             if 'finished' in output:
                 done = True
             output = output.replace(oldoutput, '')
-            print(output)
+            if not quiet:
+                print(output)
             oldoutput = output
         return True
 
@@ -1932,7 +2022,7 @@ $INFO
         if os.path.exists('/i_am_a_container'):
             os.environ['PATH'] += ':/workdir'
         else:
-            os.environ['PATH'] += ':.'
+            os.environ['PATH'] += ':%s' % os.getcwd()
         plandir = os.path.dirname(kubeadm.create.__code__.co_filename)
         kubeadm.create(self, plandir, cluster, overrides)
 
@@ -1940,7 +2030,7 @@ $INFO
         if os.path.exists('/i_am_a_container'):
             os.environ['PATH'] += ':/workdir'
         else:
-            os.environ['PATH'] += ':.'
+            os.environ['PATH'] += ':%s' % os.getcwd()
         plandir = os.path.dirname(k3s.create.__code__.co_filename)
         k3s.create(self, plandir, cluster, overrides)
 
@@ -1948,16 +2038,22 @@ $INFO
         if os.path.exists('/i_am_a_container'):
             os.environ['PATH'] += ':/workdir'
         else:
-            os.environ['PATH'] += ':.'
+            os.environ['PATH'] += ':%s' % os.getcwd()
         plandir = os.path.dirname(openshift.create.__code__.co_filename)
         openshift.create(self, plandir, cluster, overrides)
 
     def delete_kube(self, cluster, overrides={}):
-        self.plan(cluster, delete=True)
-        clusterdir = common.pwd_path("clusters/%s" % cluster)
+        cluster = overrides.get('cluster', cluster)
+        plan = cluster
+        clusterdir = os.path.expanduser("~/.kcli/clusters/%s" % cluster)
         if os.path.exists(clusterdir):
-            common.pprint("Deleting %s" % common.real_path(clusterdir), color='green')
+            if os.path.exists("%s/kcli_parameters.yml" % clusterdir):
+                with open("%s/kcli_parameters.yml" % clusterdir, 'r') as install:
+                    installparam = yaml.safe_load(install)
+                    plan = installparam.get('plan', plan)
+            common.pprint("Deleting %s" % clusterdir, color='green')
             rmtree(clusterdir)
+        self.plan(plan, delete=True)
 
     def scale_kube_generic(self, cluster, overrides={}):
         plandir = os.path.dirname(kubeadm.create.__code__.co_filename)
@@ -1971,26 +2067,11 @@ $INFO
         plandir = os.path.dirname(openshift.create.__code__.co_filename)
         openshift.scale(self, plandir, cluster, overrides)
 
-    def download_openshift_installer(self, overrides={}):
-        pull_secret = overrides.get('pull_secret', 'openshift_pull.json')
-        version = overrides.get('version', 'stable')
-        tag = overrides.get('tag', '4.5')
-        upstream = overrides.get('upstream', False)
-        macosx = True if os.path.exists('/Users') else False
-        if version == 'ci':
-            openshift.get_ci_installer(pull_secret, tag=tag, macosx=macosx, upstream=upstream)
-        elif version == 'nightly':
-            openshift.get_downstream_installer(nightly=True, tag=tag, macosx=macosx)
-        elif upstream:
-            openshift.get_upstream_installer(tag=tag, macosx=macosx)
-        else:
-            openshift.get_downstream_installer(tag=tag, macosx=macosx)
-
-    def expose_plan(self, plan, inputfile=None, overrides={}):
+    def expose_plan(self, plan, inputfile=None, overrides={}, port=9000, extraconfigs={}):
         inputfile = os.path.expanduser(inputfile)
         if not os.path.exists(inputfile):
             common.pprint("No input file found nor default kcli_plan.yml.Leaving....", color='red')
             os._exit(1)
         common.pprint("Handling expose of plan with name %s and inputfile %s" % (plan, inputfile))
-        kexposer = Kexposer(self, inputfile, overrides=overrides, plan=plan)
+        kexposer = Kexposer(self, plan, inputfile, overrides=overrides, port=port, extraconfigs=extraconfigs)
         kexposer.run()

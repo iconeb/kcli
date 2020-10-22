@@ -4,7 +4,7 @@
 
 from distutils.spawn import find_executable
 from kvirt.config import Kconfig
-from kvirt.examples import hostcreate, _list, plancreate, planinfo, productinfo, repocreate, start
+from kvirt.examples import userdatacreate, hostcreate, _list, plancreate, planinfo, productinfo, repocreate, start
 from kvirt.examples import kubegenericcreate, kubek3screate, kubeopenshiftcreate
 from kvirt.examples import dnscreate, diskcreate, diskdelete, vmcreate, vmconsole, vmexport, niccreate, nicdelete
 from kvirt.baseconfig import Kbaseconfig
@@ -14,14 +14,14 @@ from kvirt.defaults import IMAGES, VERSION
 from prettytable import PrettyTable
 import argcomplete
 import argparse
+from argparse import RawDescriptionHelpFormatter as rawhelp
 from kvirt import common
 from kvirt import nameutils
 import os
 import random
-import re
+import requests
 import sys
 import yaml
-from urllib.request import urlopen
 
 
 def cache_vms(baseconfig, region, zone, namespace):
@@ -89,23 +89,17 @@ def get_subparser(parser, subcommand):
 
 
 def get_version(args):
-    url = "https://github.com/karmab/kcli"
     full_version = "version: %s" % VERSION
     versiondir = os.path.dirname(version.__file__)
     git_version = open('%s/git' % versiondir).read().rstrip() if os.path.exists('%s/git' % versiondir) else 'N/A'
     full_version += " commit: %s" % git_version
     update = 'N/A'
     if git_version != 'N/A':
-        update = False
-        r = urlopen("%s/commits/master" % url)
-        for line in r.readlines():
-            if '%s/commits/master?' % url in str(line, 'utf-8').strip():
-                tag_match = re.match('.*=(.*)\\+..".*', str(line, 'utf-8'))
-                if tag_match is not None:
-                    upstream_version = tag_match.group(1)[:7]
-                    if upstream_version != git_version:
-                        update = True
-                break
+        try:
+            upstream_version = requests.get("https://api.github.com/repos/karmab/kcli/commits/master").json()['sha'][:7]
+            update = True if upstream_version != git_version else False
+        except:
+            pass
     full_version += " Available Updates: %s" % update
     print(full_version)
 
@@ -308,6 +302,19 @@ def download_image(args):
         os._exit(1)
 
 
+def download_iso(args):
+    """Download ISO"""
+    pool = args.pool
+    url = args.iso
+    iso = os.path.basename(url)
+    config = Kconfig(client=args.client, debug=args.debug, region=args.region, zone=args.zone, namespace=args.namespace)
+    result = config.handle_host(pool=pool, image=iso, download=True, url=url, update_profile=False)
+    if result['result'] == 'success':
+        os._exit(0)
+    else:
+        os._exit(1)
+
+
 def delete_image(args):
     images = args.images
     yes = args.yes
@@ -387,21 +394,20 @@ def info_vm(args):
     output = args.output
     fields = args.fields.split(',') if args.fields is not None else []
     values = args.values
-    k = None
-    baseconfig = Kbaseconfig(client=args.client, debug=args.debug)
-    names = [common.get_lastvm(baseconfig.client)] if not args.names else args.names
-    if baseconfig.cache:
-        _list = cache_vms(baseconfig, args.region, args.zone, args.namespace)
+    config = Kbaseconfig(client=args.client, debug=args.debug, quiet=True)
+    if config.cache:
+        names = [common.get_lastvm(config.client)] if not args.names else args.names
+        _list = cache_vms(config, args.region, args.zone, args.namespace)
         vms = {vm['name']: vm for vm in _list}
+    else:
+        config = Kconfig(client=args.client, debug=args.debug, region=args.region, zone=args.zone,
+                         namespace=args.namespace)
+        names = [common.get_lastvm(config.client)] if not args.names else args.names
     for name in names:
-        if baseconfig.cache and name in vms:
+        if config.cache and name in vms:
             data = vms[name]
         else:
-            if k is None:
-                config = Kconfig(client=args.client, debug=args.debug, region=args.region, zone=args.zone,
-                                 namespace=args.namespace)
-                k = config.k
-            data = k.info(name, debug=args.debug)
+            data = config.k.info(name, debug=args.debug)
         if data:
             print(common.print_info(data, output=output, fields=fields, values=values, pretty=True))
 
@@ -473,9 +479,9 @@ def list_vm(args):
         print(vms)
     else:
         vms = PrettyTable(["Name", "Status", "Ips", "Source", "Plan", "Profile"])
-        baseconfig = Kbaseconfig(client=args.client, debug=args.debug, quiet=True)
-        if baseconfig.cache:
-            _list = cache_vms(baseconfig, args.region, args.zone, args.namespace)
+        config = Kbaseconfig(client=args.client, debug=args.debug, quiet=True)
+        if config.cache:
+            _list = cache_vms(config, args.region, args.zone, args.namespace)
         else:
             config = Kconfig(client=args.client, debug=args.debug, region=args.region,
                              zone=args.zone, namespace=args.namespace)
@@ -488,8 +494,6 @@ def list_vm(args):
             plan = vm.get('plan', '')
             profile = vm.get('profile', '')
             vminfo = [name, status, ip, source, plan, profile]
-            if baseconfig.planview and vm[4] != baseconfig.currentplan:
-                continue
             if filters:
                 if status == filters:
                     vms.add_row(vminfo)
@@ -583,6 +587,30 @@ def list_lb(args):
     loadbalancerstable.align["Loadbalancer"] = "l"
     print(loadbalancerstable)
     return
+
+
+def info_profile(args):
+    """List profiles"""
+    profile = args.profile
+    baseconfig = Kbaseconfig(client=args.client, debug=args.debug)
+    profiles = baseconfig.list_profiles()
+    for entry in profiles:
+        if entry[0] == profile:
+            profile, flavor, pool, disks, image, nets, cloudinit, nested, reservedns, reservehost = entry
+            print("profile: %s" % profile)
+            print("flavor: %s" % flavor)
+            print("pool: %s" % pool)
+            print("disks: %s" % disks)
+            print("image: %s" % image)
+            print("nets: %s" % nets)
+            print("cloudinit: %s" % cloudinit)
+            print("nested: %s" % nested)
+            print("reservedns: %s" % reservedns)
+            print("reservehost: %s" % reservehost)
+            os._exit(0)
+            break
+    common.pprint("Profile %s doesn't exist" % profile, color='red')
+    os._exit(1)
 
 
 def list_profile(args):
@@ -749,11 +777,136 @@ def list_plan(args):
     return
 
 
+def choose_parameter_file(paramfile):
+    if os.path.exists("/i_am_a_container"):
+        if paramfile is not None:
+            paramfile = "/workdir/%s" % paramfile
+        elif os.path.exists("/workdir/kcli_parameters.yml"):
+            paramfile = "/workdir/kcli_parameters.yml"
+            common.pprint("Using default parameter file kcli_parameters.yml", color='blue')
+    elif paramfile is None and os.path.exists("kcli_parameters.yml"):
+        paramfile = "kcli_parameters.yml"
+        common.pprint("Using default parameter file kcli_parameters.yml", color='blue')
+    return paramfile
+
+
+def create_app_generic(args):
+    apps = args.apps
+    paramfile = choose_parameter_file(args.paramfile)
+    if find_executable('kubectl') is None:
+        common.pprint("You need kubectl to install apps", color='red')
+        os._exit(1)
+    if 'KUBECONFIG' not in os.environ:
+        common.pprint("KUBECONFIG env variable needs to be set", color='red')
+        os._exit(1)
+    elif not os.path.isabs(os.environ['KUBECONFIG']):
+        os.environ['KUBECONFIG'] = "%s/%s" % (os.getcwd(), os.environ['KUBECONFIG'])
+    overrides = common.get_overrides(paramfile=paramfile, param=args.param)
+    baseconfig = Kbaseconfig(client=args.client, debug=args.debug)
+    available_apps = baseconfig.list_apps_generic(quiet=True)
+    for app in apps:
+        if app not in available_apps:
+            common.pprint("app %s not available. Skipping..." % app, color='red')
+            continue
+        common.pprint("Adding app %s" % app, color='blue')
+        overrides['%s_version' % app] = overrides['version'] if 'version' in overrides else 'latest'
+        baseconfig.create_app_generic(app, overrides)
+
+
+def create_app_openshift(args):
+    apps = args.apps
+    paramfile = choose_parameter_file(args.paramfile)
+    if find_executable('oc') is None:
+        common.pprint("You need oc to install apps", color='red')
+        os._exit(1)
+    if 'KUBECONFIG' not in os.environ:
+        common.pprint("KUBECONFIG env variable needs to be set", color='red')
+        os._exit(1)
+    elif not os.path.isabs(os.environ['KUBECONFIG']):
+        os.environ['KUBECONFIG'] = "%s/%s" % (os.getcwd(), os.environ['KUBECONFIG'])
+    OPENSHIFT_VERSION = os.popen('oc version').readlines()[1].split(" ")[2].strip().replace('v', '')[:3]
+    overrides = common.get_overrides(paramfile=paramfile, param=args.param)
+    overrides['openshift_version'] = OPENSHIFT_VERSION
+    baseconfig = Kbaseconfig(client=args.client, debug=args.debug)
+    available_apps = baseconfig.list_apps_openshift(quiet=True)
+    for app in apps:
+        if app not in available_apps:
+            common.pprint("app %s not available. Skipping..." % app, color='red')
+            continue
+        common.pprint("Adding app %s" % app, color='blue')
+        baseconfig.create_app_openshift(app, overrides)
+
+
+def delete_app_generic(args):
+    apps = args.apps
+    paramfile = args.paramfile
+    if find_executable('kubectl') is None:
+        common.pprint("You need kubectl to install apps", color='red')
+        os._exit(1)
+    if 'KUBECONFIG' not in os.environ:
+        common.pprint("KUBECONFIG env variable needs to be set", color='red')
+        os._exit(1)
+    elif not os.path.isabs(os.environ['KUBECONFIG']):
+        os.environ['KUBECONFIG'] = "%s/%s" % (os.getcwd(), os.environ['KUBECONFIG'])
+    overrides = common.get_overrides(paramfile=paramfile, param=args.param)
+    baseconfig = Kbaseconfig(client=args.client, debug=args.debug)
+    available_apps = baseconfig.list_apps_generic(quiet=True)
+    for app in apps:
+        if app not in available_apps:
+            common.pprint("app %s not available. Skipping..." % app, color='red')
+            continue
+        common.pprint("Deleting app %s" % app, color='blue')
+        overrides['%s_version' % app] = overrides['version'] if 'version' in overrides else 'latest'
+        baseconfig.delete_app_generic(app, overrides)
+
+
+def delete_app_openshift(args):
+    apps = args.apps
+    paramfile = choose_parameter_file(args.paramfile)
+    if find_executable('oc') is None:
+        common.pprint("You need oc to install apps", color='red')
+        os._exit(1)
+    if 'KUBECONFIG' not in os.environ:
+        common.pprint("KUBECONFIG env variable needs to be set", color='red')
+        os._exit(1)
+    elif not os.path.isabs(os.environ['KUBECONFIG']):
+        os.environ['KUBECONFIG'] = "%s/%s" % (os.getcwd(), os.environ['KUBECONFIG'])
+    OPENSHIFT_VERSION = os.popen('oc version').readlines()[1].split(" ")[2].strip().replace('v', '')[:3]
+    overrides = common.get_overrides(paramfile=paramfile, param=args.param)
+    overrides['openshift_version'] = OPENSHIFT_VERSION
+    baseconfig = Kbaseconfig(client=args.client, debug=args.debug)
+    available_apps = baseconfig.list_apps_openshift(quiet=True)
+    for app in apps:
+        if app not in available_apps:
+            common.pprint("app %s not available. Skipping..." % app, color='red')
+            continue
+        common.pprint("Deleting app %s" % app, color='blue')
+        baseconfig.delete_app_openshift(app, overrides)
+
+
+def list_apps_generic(args):
+    """List generic kube apps"""
+    baseconfig = Kbaseconfig(client=args.client, debug=args.debug)
+    apps = PrettyTable(["Name"])
+    for app in baseconfig.list_apps_generic(quiet=True):
+        apps.add_row([app])
+    print(apps)
+
+
+def list_apps_openshift(args):
+    """List openshift kube apps"""
+    baseconfig = Kbaseconfig(client=args.client, debug=args.debug)
+    apps = PrettyTable(["Name"])
+    for app in baseconfig.list_apps_openshift(quiet=True):
+        apps.add_row([app])
+    print(apps)
+
+
 def list_kube(args):
     """List kube"""
     config = Kconfig(client=args.client, debug=args.debug, region=args.region, zone=args.zone, namespace=args.namespace)
     if config.extraclients:
-        kubestable = PrettyTable(["Cluster", "Type", "Host", "Vms"])
+        kubestable = PrettyTable(["Cluster", "Type", "Plan", "Host", "Vms"])
         allclients = config.extraclients.copy()
         allclients.update({config.client: config.k})
         for cli in sorted(allclients):
@@ -763,16 +916,18 @@ def list_kube(args):
             for kubename in kubes:
                 kube = kubes[kubename]
                 kubetype = kube['type']
+                kubeplan = kube['plan']
                 kubevms = kube['vms']
-                kubestable.add_row([kubename, kubetype, cli, kubevms])
+                kubestable.add_row([kubename, kubetype, kubeplan, cli, kubevms])
     else:
-        kubestable = PrettyTable(["Cluster", "Type", "Vms"])
+        kubestable = PrettyTable(["Cluster", "Type", "Plan", "Vms"])
         kubes = config.list_kubes()
         for kubename in kubes:
             kube = kubes[kubename]
             kubetype = kube['type']
             kubevms = kube['vms']
-            kubestable.add_row([kubename, kubetype, kubevms])
+            kubeplan = kube['plan']
+            kubestable.add_row([kubename, kubetype, kubeplan, kubevms])
     print(kubestable)
     return
 
@@ -869,12 +1024,21 @@ def list_vmdisk(args):
 def create_vm(args):
     """Create vms"""
     name = args.name
+    onlyassets = True if 'assets' in vars(args) else False
     image = args.image
     profile = args.profile
     count = args.count
     profilefile = args.profilefile
     overrides = common.get_overrides(paramfile=args.paramfile, param=args.param)
     wait = args.wait
+    if 'wait' in overrides and isinstance(overrides['wait'], bool) and overrides['wait']:
+        wait = True
+    if wait and 'keys' not in overrides and not os.path.exists(os.path.expanduser("~/.ssh/id_rsa.pub"))\
+            and not os.path.exists(os.path.expanduser("~/.ssh/id_dsa.pub"))\
+            and not os.path.exists(os.path.expanduser("~/.kcli/id_rsa.pub"))\
+            and not os.path.exists(os.path.expanduser("~/.kcli/id_dsa.pub")):
+                common.pprint("No usable public key found, which is mandatory when using wait", color='red')
+                os._exit(1)
     customprofile = {}
     config = Kconfig(client=args.client, debug=args.debug, region=args.region, zone=args.zone, namespace=args.namespace)
     for key in overrides:
@@ -888,10 +1052,10 @@ def create_vm(args):
         name = nameutils.get_random_name()
         if config.type in ['gcp', 'kubevirt']:
             name = name.replace('_', '-')
-        if config.type != 'aws':
+        if config.type != 'aws' and not onlyassets:
             common.pprint("Using %s as name of the vm" % name)
     if image is not None:
-        if image in config.profiles:
+        if image in config.profiles and not onlyassets:
             common.pprint("Using %s as profile" % image)
         profile = image
     elif profile is not None:
@@ -912,25 +1076,29 @@ def create_vm(args):
                     else:
                         common.pprint("Cant' parse %s as profile file" % profilefile, color='red')
                         os._exit(1)
-    elif overrides:
+    elif overrides or onlyassets:
         profile = 'kvirt'
         config.profiles[profile] = {}
     else:
         common.pprint("You need to either provide a profile, an image or some parameters", color='red')
         os._exit(1)
     if count == 1:
-        result = config.create_vm(name, profile, overrides=overrides, customprofile=customprofile, wait=wait)
-        code = common.handle_response(result, name, element='', action='created', client=config.client)
-        return code
+        result = config.create_vm(name, profile, overrides=overrides, customprofile=customprofile, wait=wait,
+                                  onlyassets=onlyassets)
+        if not onlyassets:
+            code = common.handle_response(result, name, element='', action='created', client=config.client)
+            return code
     else:
         codes = []
         if 'plan' not in overrides:
             overrides['plan'] = name
         for number in range(count):
             currentname = "%s-%d" % (name, number)
-            result = config.create_vm(currentname, profile, overrides=overrides, customprofile=customprofile, wait=wait)
-            codes.append(common.handle_response(result, currentname, element='', action='created',
-                                                client=config.client))
+            result = config.create_vm(currentname, profile, overrides=overrides, customprofile=customprofile, wait=wait,
+                                      onlyassets=onlyassets)
+            if not onlyassets:
+                codes.append(common.handle_response(result, currentname, element='', action='created',
+                                                    client=config.client))
         return max(codes)
 
 
@@ -1136,16 +1304,16 @@ def create_generic_kube(args):
     """Create Generic kube"""
     paramfile = args.paramfile
     force = args.force
-    cluster = args.cluster if args.cluster is not None else 'testk'
+    cluster = args.cluster
     if os.path.exists("/i_am_a_container"):
         if paramfile is not None:
             paramfile = "/workdir/%s" % paramfile
         elif os.path.exists("/workdir/kcli_parameters.yml"):
             paramfile = "/workdir/kcli_parameters.yml"
-            common.pprint("Using default parameter file kcli_parameters.yml")
+            common.pprint("Using default parameter file kcli_parameters.yml", color='blue')
     elif paramfile is None and os.path.exists("kcli_parameters.yml"):
         paramfile = "kcli_parameters.yml"
-        common.pprint("Using default parameter file kcli_parameters.yml")
+        common.pprint("Using default parameter file kcli_parameters.yml", color='blue')
     config = Kconfig(client=args.client, debug=args.debug, region=args.region, zone=args.zone, namespace=args.namespace)
     overrides = common.get_overrides(paramfile=paramfile, param=args.param)
     if force:
@@ -1163,10 +1331,10 @@ def create_k3s_kube(args):
             paramfile = "/workdir/%s" % paramfile
         elif os.path.exists("/workdir/kcli_parameters.yml"):
             paramfile = "/workdir/kcli_parameters.yml"
-            common.pprint("Using default parameter file kcli_parameters.yml")
+            common.pprint("Using default parameter file kcli_parameters.yml", color='blue')
     elif paramfile is None and os.path.exists("kcli_parameters.yml"):
         paramfile = "kcli_parameters.yml"
-        common.pprint("Using default parameter file kcli_parameters.yml")
+        common.pprint("Using default parameter file kcli_parameters.yml", color='blue')
     config = Kconfig(client=args.client, debug=args.debug, region=args.region, zone=args.zone, namespace=args.namespace)
     overrides = common.get_overrides(paramfile=paramfile, param=args.param)
     if force:
@@ -1178,16 +1346,16 @@ def create_openshift_kube(args):
     """Create Generic kube"""
     paramfile = args.paramfile
     force = args.force
-    cluster = args.cluster if args.cluster is not None else 'testk'
+    cluster = args.cluster
     if os.path.exists("/i_am_a_container"):
         if paramfile is not None:
             paramfile = "/workdir/%s" % paramfile
         elif os.path.exists("/workdir/kcli_parameters.yml"):
             paramfile = "/workdir/kcli_parameters.yml"
-            common.pprint("Using default parameter file kcli_parameters.yml")
+            common.pprint("Using default parameter file kcli_parameters.yml", color='blue')
     elif paramfile is None and os.path.exists("kcli_parameters.yml"):
         paramfile = "kcli_parameters.yml"
-        common.pprint("Using default parameter file kcli_parameters.yml")
+        common.pprint("Using default parameter file kcli_parameters.yml", color='blue')
     config = Kconfig(client=args.client, debug=args.debug, region=args.region, zone=args.zone, namespace=args.namespace)
     overrides = common.get_overrides(paramfile=paramfile, param=args.param)
     if args.subcommand_create_kube == 'okd':
@@ -1214,15 +1382,19 @@ def scale_generic_kube(args):
     workers = args.workers
     paramfile = args.paramfile
     cluster = args.cluster if args.cluster is not None else 'testk'
+    clusterdir = os.path.expanduser("~/.kcli/clusters/%s" % cluster)
+    if not os.path.exists(clusterdir):
+        common.pprint("Cluster directory %s not found..." % clusterdir, color='red')
+        sys.exit(1)
     if os.path.exists("/i_am_a_container"):
         if paramfile is not None:
             paramfile = "/workdir/%s" % paramfile
         elif os.path.exists("/workdir/kcli_parameters.yml"):
             paramfile = "/workdir/kcli_parameters.yml"
-            common.pprint("Using default parameter file kcli_parameters.yml")
+            common.pprint("Using default parameter file kcli_parameters.yml", color='blue')
     elif paramfile is None and os.path.exists("kcli_parameters.yml"):
         paramfile = "kcli_parameters.yml"
-        common.pprint("Using default parameter file kcli_parameters.yml")
+        common.pprint("Using default parameter file kcli_parameters.yml", color='blue')
     config = Kconfig(client=args.client, debug=args.debug, region=args.region, zone=args.zone, namespace=args.namespace)
     overrides = common.get_overrides(paramfile=paramfile, param=args.param)
     if workers > 0:
@@ -1235,15 +1407,19 @@ def scale_k3s_kube(args):
     workers = args.workers
     paramfile = args.paramfile
     cluster = args.cluster if args.cluster is not None else 'testk'
+    clusterdir = os.path.expanduser("~/.kcli/clusters/%s" % cluster)
+    if not os.path.exists(clusterdir):
+        common.pprint("Cluster directory %s not found..." % clusterdir, color='red')
+        sys.exit(1)
     if os.path.exists("/i_am_a_container"):
         if paramfile is not None:
             paramfile = "/workdir/%s" % paramfile
         elif os.path.exists("/workdir/kcli_parameters.yml"):
             paramfile = "/workdir/kcli_parameters.yml"
-            common.pprint("Using default parameter file kcli_parameters.yml")
+            common.pprint("Using default parameter file kcli_parameters.yml", color='blue')
     elif paramfile is None and os.path.exists("kcli_parameters.yml"):
         paramfile = "kcli_parameters.yml"
-        common.pprint("Using default parameter file kcli_parameters.yml")
+        common.pprint("Using default parameter file kcli_parameters.yml", color='blue')
     config = Kconfig(client=args.client, debug=args.debug, region=args.region, zone=args.zone, namespace=args.namespace)
     overrides = common.get_overrides(paramfile=paramfile, param=args.param)
     if workers > 0:
@@ -1256,15 +1432,19 @@ def scale_openshift_kube(args):
     workers = args.workers
     paramfile = args.paramfile
     cluster = args.cluster if args.cluster is not None else 'testk'
+    clusterdir = os.path.expanduser("~/.kcli/clusters/%s" % cluster)
+    if not os.path.exists(clusterdir):
+        common.pprint("Cluster directory %s not found..." % clusterdir, color='red')
+        sys.exit(1)
     if os.path.exists("/i_am_a_container"):
         if paramfile is not None:
             paramfile = "/workdir/%s" % paramfile
         elif os.path.exists("/workdir/kcli_parameters.yml"):
             paramfile = "/workdir/kcli_parameters.yml"
-            common.pprint("Using default parameter file kcli_parameters.yml")
+            common.pprint("Using default parameter file kcli_parameters.yml", color='blue')
     elif paramfile is None and os.path.exists("kcli_parameters.yml"):
         paramfile = "kcli_parameters.yml"
-        common.pprint("Using default parameter file kcli_parameters.yml")
+        common.pprint("Using default parameter file kcli_parameters.yml", color='blue')
     config = Kconfig(client=args.client, debug=args.debug, region=args.region, zone=args.zone, namespace=args.namespace)
     overrides = common.get_overrides(paramfile=paramfile, param=args.param)
     if workers > 0:
@@ -1345,10 +1525,10 @@ def create_plan(args):
             paramfile = "/workdir/%s" % paramfile
         elif os.path.exists("/workdir/kcli_parameters.yml"):
             paramfile = "/workdir/kcli_parameters.yml"
-            common.pprint("Using default parameter file kcli_parameters.yml")
+            common.pprint("Using default parameter file kcli_parameters.yml", color='blue')
     elif paramfile is None and os.path.exists("kcli_parameters.yml"):
         paramfile = "kcli_parameters.yml"
-        common.pprint("Using default parameter file kcli_parameters.yml")
+        common.pprint("Using default parameter file kcli_parameters.yml", color='blue')
     overrides = common.get_overrides(paramfile=paramfile, param=args.param)
     config = Kconfig(client=args.client, debug=args.debug, region=args.region, zone=args.zone, namespace=args.namespace)
     _type = config.ini[config.client].get('type', 'kvm')
@@ -1404,6 +1584,10 @@ def delete_plan(args):
 
 def expose_plan(args):
     plan = args.plan
+    if plan is None:
+        plan = nameutils.get_random_name()
+        common.pprint("Using %s as name of the plan" % plan)
+    port = args.port
     inputfile = args.inputfile
     if inputfile is None:
         inputfile = 'kcli_plan.yml'
@@ -1411,7 +1595,11 @@ def expose_plan(args):
         inputfile = "/workdir/%s" % inputfile
     overrides = common.get_overrides(param=args.param)
     config = Kconfig(client=args.client, debug=args.debug, region=args.region, zone=args.zone, namespace=args.namespace)
-    config.expose_plan(plan, inputfile=inputfile, overrides=overrides)
+    extraconfigs = {}
+    for extraclient in config.extraclients:
+        extraconfigs[extraclient] = Kconfig(client=extraclient, debug=args.debug, region=args.region, zone=args.zone,
+                                            namespace=args.namespace)
+    config.expose_plan(plan, inputfile=inputfile, overrides=overrides, port=port, extraconfigs=extraconfigs)
     return 0
 
 
@@ -1455,9 +1643,18 @@ def restart_plan(args):
     return 0
 
 
+def info_generic_app(args):
+    baseconfig = Kbaseconfig(client=args.client, debug=args.debug)
+    baseconfig.info_app_generic(args.app)
+
+
+def info_openshift_app(args):
+    baseconfig = Kbaseconfig(client=args.client, debug=args.debug)
+    baseconfig.info_app_openshift(args.app)
+
+
 def info_plan(args):
     """Info plan """
-    plan = args.plan
     doc = args.doc
     quiet = args.quiet
     url = args.url
@@ -1466,13 +1663,12 @@ def info_plan(args):
     if os.path.exists("/i_am_a_container"):
         inputfile = "/workdir/%s" % inputfile if inputfile is not None else "/workdir/kcli_plan.yml"
     if url is None:
-        inputfile = plan if inputfile is None and plan is not None else inputfile
         baseconfig = Kbaseconfig(client=args.client, debug=args.debug)
         baseconfig.info_plan(inputfile, quiet=quiet, doc=doc)
     else:
         config = Kconfig(client=args.client, debug=args.debug, region=args.region, zone=args.zone,
                          namespace=args.namespace)
-        config.plan(plan, url=url, path=path, inputfile=inputfile, info=True, quiet=quiet, doc=doc)
+        config.plan('info', url=url, path=path, inputfile=inputfile, info=True, quiet=quiet, doc=doc)
     return 0
 
 
@@ -1513,7 +1709,18 @@ def download_kubectl(args):
 
 def download_oc(args):
     """Download Oc"""
-    common.get_oc()
+    paramfile = args.paramfile
+    if os.path.exists("/i_am_a_container"):
+        if paramfile is not None:
+            paramfile = "/workdir/%s" % paramfile
+        elif os.path.exists("/workdir/kcli_parameters.yml"):
+            paramfile = "/workdir/kcli_parameters.yml"
+            common.pprint("Using default parameter file kcli_parameters.yml", color='blue')
+    elif paramfile is None and os.path.exists("kcli_parameters.yml"):
+        paramfile = "kcli_parameters.yml"
+        common.pprint("Using default parameter file kcli_parameters.yml", color='blue')
+    overrides = common.get_overrides(paramfile=paramfile, param=args.param)
+    common.get_oc(version=overrides.get('version', 'latest'))
 
 
 def download_openshift_installer(args):
@@ -1524,14 +1731,16 @@ def download_openshift_installer(args):
             paramfile = "/workdir/%s" % paramfile
         elif os.path.exists("/workdir/kcli_parameters.yml"):
             paramfile = "/workdir/kcli_parameters.yml"
-            common.pprint("Using default parameter file kcli_parameters.yml")
+            common.pprint("Using default parameter file kcli_parameters.yml", color='blue')
     elif paramfile is None and os.path.exists("kcli_parameters.yml"):
         paramfile = "kcli_parameters.yml"
-        common.pprint("Using default parameter file kcli_parameters.yml")
+        common.pprint("Using default parameter file kcli_parameters.yml", color='blue')
     overrides = common.get_overrides(paramfile=paramfile, param=args.param)
-    config = Kconfig(client=args.client, debug=args.debug, region=args.region, zone=args.zone, namespace=args.namespace)
-    config.download_openshift_installer(overrides)
-    return 0
+    baseconfig = Kbaseconfig(client=args.client, debug=args.debug)
+    run = baseconfig.download_openshift_installer(overrides)
+    if run != 0:
+        common.pprint("Couldn't download openshift-install", color='red')
+    return run
 
 
 def download_okd_installer(args):
@@ -1542,15 +1751,17 @@ def download_okd_installer(args):
             paramfile = "/workdir/%s" % paramfile
         elif os.path.exists("/workdir/kcli_parameters.yml"):
             paramfile = "/workdir/kcli_parameters.yml"
-            common.pprint("Using default parameter file kcli_parameters.yml")
+            common.pprint("Using default parameter file kcli_parameters.yml", color='blue')
     elif paramfile is None and os.path.exists("kcli_parameters.yml"):
         paramfile = "kcli_parameters.yml"
-        common.pprint("Using default parameter file kcli_parameters.yml")
+        common.pprint("Using default parameter file kcli_parameters.yml", color='blue')
     overrides = common.get_overrides(paramfile=paramfile, param=args.param)
-    config = Kconfig(client=args.client, debug=args.debug, region=args.region, zone=args.zone, namespace=args.namespace)
+    baseconfig = Kbaseconfig(client=args.client, debug=args.debug)
     overrides['upstream'] = True
-    config.download_openshift_installer(overrides)
-    return 0
+    run = baseconfig.download_openshift_installer(overrides)
+    if run != 0:
+        common.pprint("Couldn't download openshift-install", color='red')
+    return run
 
 
 def create_pipeline(args):
@@ -1590,10 +1801,8 @@ def render_file(args):
             paramfile = "/workdir/%s" % paramfile
         elif os.path.exists("/workdir/kcli_parameters.yml"):
             paramfile = "/workdir/kcli_parameters.yml"
-            # common.pprint("Using default parameter file kcli_parameters.yml")
     elif paramfile is None and os.path.exists("kcli_parameters.yml"):
         paramfile = "kcli_parameters.yml"
-        # common.pprint("Using default parameter file kcli_parameters.yml")
     overrides = common.get_overrides(paramfile=paramfile, param=args.param)
     baseconfig = Kbaseconfig(client=args.client, debug=args.debug)
     config_data = {'config_%s' % k: baseconfig.ini[baseconfig.client][k] for k in baseconfig.ini[baseconfig.client]}
@@ -1607,19 +1816,68 @@ def render_file(args):
     return 0
 
 
-def snapshot_plan(args):
-    """Snapshot plan"""
-    plan = args.plan
-    config = Kconfig(client=args.client, debug=args.debug, region=args.region, zone=args.zone, namespace=args.namespace)
-    config.plan(plan, snapshot=True)
+def create_userdata(args):
+    """Create cloudinit/ignition data"""
+    plan = None
+    inputfile = args.inputfile
+    if inputfile is None:
+        args.assets = True
+        args.profile = None
+        args.profilefile = None
+        args.wait = False
+        args.count = 1
+        return create_vm(args)
+    paramfile = args.paramfile
+    if os.path.exists("/i_am_a_container"):
+        inputfile = "/workdir/%s" % inputfile if inputfile is not None else "/workdir/kcli_plan.yml"
+        if paramfile is not None:
+            paramfile = "/workdir/%s" % paramfile
+        elif os.path.exists("/workdir/kcli_parameters.yml"):
+            paramfile = "/workdir/kcli_parameters.yml"
+    elif paramfile is None and os.path.exists("kcli_parameters.yml"):
+        paramfile = "kcli_parameters.yml"
+    overrides = common.get_overrides(paramfile=paramfile, param=args.param)
+    config = Kconfig(client=args.client, debug=args.debug, region=args.region, zone=args.zone,
+                     namespace=args.namespace)
+    config_data = {'config_%s' % k: config.ini[config.client][k] for k in config.ini[config.client]}
+    config_data['config_type'] = config_data.get('config_type', 'kvm')
+    overrides.update(config_data)
+    if not os.path.exists(inputfile):
+        common.pprint("File %s not found" % inputfile, color='red')
+        return 0
+    config.plan(plan, inputfile=inputfile, overrides=overrides, onlyassets=True)
     return 0
 
 
-def revert_plan(args):
+def create_snapshot_plan(args):
+    """Snapshot plan"""
+    plan = args.plan
+    snapshot = args.snapshot
+    config = Kconfig(client=args.client, debug=args.debug, region=args.region, zone=args.zone, namespace=args.namespace)
+    config.plan(plan, snapshot=True, snapshotname=snapshot)
+    return 0
+
+
+def delete_snapshot_plan(args):
+    """Snapshot plan"""
+    plan = args.plan
+    snapshot = args.snapshot
+    config = Kconfig(client=args.client, debug=args.debug, region=args.region, zone=args.zone, namespace=args.namespace)
+    k = config.k
+    for vm in sorted(k.list(), key=lambda x: x['name']):
+        name = vm['name']
+        if vm['plan'] == plan:
+            common.pprint("Deleting snapshot %s of vm %s..." % (snapshot, name))
+            k.snapshot(snapshot, name, delete=True)
+    return 0
+
+
+def revert_snapshot_plan(args):
     """Revert snapshot of plan"""
     plan = args.plan
+    snapshot = args.snapshot
     config = Kconfig(client=args.client, debug=args.debug, region=args.region, zone=args.zone, namespace=args.namespace)
-    config.plan(plan, revert=True)
+    config.plan(plan, revert=True, snapshotname=snapshot)
     return 0
 
 
@@ -1699,15 +1957,16 @@ def ssh_vm(args):
     X = args.X
     Y = args.Y
     user = args.user
-    baseconfig = Kbaseconfig(client=args.client, debug=args.debug)
+    vmport = args.port
+    baseconfig = Kbaseconfig(client=args.client, debug=args.debug, quiet=True)
     name = [common.get_lastvm(baseconfig.client)] if not args.name else args.name
     tunnel = baseconfig.tunnel
-    tunnelhost = baseconfig.tunnelhost if baseconfig.tunnelhost is not None else baseconfig.host
-    if tunnel and tunnelhost == '127.0.0.1':
-        common.pprint("Tunnel requested but invalid tunnelhost", color='red')
+    tunnelhost = baseconfig.tunnelhost
+    tunneluser = baseconfig.tunneluser
+    tunnelport = baseconfig.tunnelport
+    if tunnel and tunnelhost is None:
+        common.pprint("Tunnel requested but no tunnelhost defined", color='red')
         os._exit(1)
-    tunnelport = baseconfig.tunnelport if baseconfig.tunnelport is not None else 22
-    tunneluser = baseconfig.tunneluser if baseconfig.tunneluser is not None else 'root'
     insecure = baseconfig.insecure
     if len(name) > 1:
         cmd = ' '.join(name[1:])
@@ -1731,8 +1990,9 @@ def ssh_vm(args):
                 common.pprint("No ip found in cache for %s..." % name, color='red')
             else:
                 if user is None:
-                    user = vm.get('user')
-                vmport = vm.get('vmport')
+                    user = baseconfig.vmuser if baseconfig.vmuser is not None else vm.get('user')
+                if vmport is None:
+                    vmport = baseconfig.vmport if baseconfig.vmport is not None else vm.get('vmport')
                 sshcommand = common.ssh(name, ip=ip, user=user, local=l, remote=r, tunnel=tunnel,
                                         tunnelhost=tunnelhost, tunnelport=tunnelport, tunneluser=tunneluser,
                                         insecure=insecure, cmd=cmd, X=X, Y=Y, D=D, debug=args.debug, vmport=vmport)
@@ -1740,8 +2000,24 @@ def ssh_vm(args):
         config = Kconfig(client=args.client, debug=args.debug, region=args.region, zone=args.zone,
                          namespace=args.namespace)
         k = config.k
-        sshcommand = k.ssh(name, user=user, local=l, remote=r, tunnel=tunnel, tunnelhost=tunnelhost,
-                           tunnelport=tunnelport, tunneluser=tunneluser, insecure=insecure, cmd=cmd, X=X, Y=Y, D=D)
+        u, ip = common._ssh_credentials(k, name)
+        if ip is None:
+            return
+        if user is None:
+            user = config.vmuser if config.vmuser is not None else u
+        if vmport is None and config.vmport is not None:
+            vmport = config.vmport
+        if config.type in ['kvm', 'packet'] and '.' not in ip and ':' not in ip:
+            vmport = ip
+            ip = config.host
+        if config.type == 'kubevirt' and not tunnel:
+            nodeport = k._node_port(name, k.namespace)
+            if nodeport is not None:
+                ip = k.host
+                vmport = nodeport
+        sshcommand = common.ssh(name, ip=ip, user=user, local=l, remote=r, tunnel=tunnel,
+                                tunnelhost=tunnelhost, tunnelport=tunnelport, tunneluser=tunneluser,
+                                insecure=insecure, cmd=cmd, X=X, Y=Y, D=D, debug=args.debug, vmport=vmport)
     if sshcommand is not None:
         if find_executable('ssh') is not None:
             os.system(sshcommand)
@@ -1758,13 +2034,14 @@ def scp_vm(args):
     source = source if not os.path.exists("/i_am_a_container") else "/workdir/%s" % source
     destination = args.destination[0]
     user = args.user
-    baseconfig = Kbaseconfig(client=args.client, debug=args.debug)
+    vmport = args.port
+    baseconfig = Kbaseconfig(client=args.client, debug=args.debug, quiet=True)
     tunnel = baseconfig.tunnel
-    tunnelhost = baseconfig.tunnelhost if baseconfig.tunnelhost is not None else baseconfig.host
-    tunnelport = baseconfig.tunnelport if baseconfig.tunnelport is not None else 22
-    tunneluser = baseconfig.tunneluser if baseconfig.tunneluser is not None else 'root'
-    if tunnel and tunnelhost == '127.0.0.1':
-        common.pprint("Tunnel requested but invalid tunnelhost", color='red')
+    tunnelhost = baseconfig.tunnelhost
+    tunneluser = baseconfig.tunneluser
+    tunnelport = baseconfig.tunnelport
+    if tunnel and tunnelhost is None:
+        common.pprint("Tunnel requested but no tunnelhost defined", color='red')
         os._exit(1)
     insecure = baseconfig.insecure
     if len(source.split(':')) == 2:
@@ -1793,8 +2070,9 @@ def scp_vm(args):
                 common.pprint("No ip found in cache for %s..." % name, color='red')
             else:
                 if user is None:
-                    user = vm.get('user')
-                vmport = vm.get('vmport')
+                    user = baseconfig.vmuser if baseconfig.vmuser is not None else vm.get('user')
+                if vmport is None:
+                    vmport = baseconfig.vmport if baseconfig.vmport is not None else vm.get('vmport')
                 scpcommand = common.scp(name, ip=ip, user=user, source=source, destination=destination,
                                         recursive=recursive, tunnel=tunnel, tunnelhost=tunnelhost,
                                         tunnelport=tunnelport, tunneluser=tunneluser, debug=args.debug,
@@ -1803,9 +2081,19 @@ def scp_vm(args):
         config = Kconfig(client=args.client, debug=args.debug, region=args.region, zone=args.zone,
                          namespace=args.namespace)
         k = config.k
-        scpcommand = k.scp(name, user=user, source=source, destination=destination,
-                           tunnel=tunnel, tunnelhost=tunnelhost, tunnelport=tunnelport, tunneluser=tunneluser,
-                           download=download, recursive=recursive, insecure=insecure)
+        u, ip = common._ssh_credentials(k, name)
+        if ip is None:
+            return
+        if user is None:
+            user = config.vmuser if config.vmuser is not None else u
+        if vmport is None and config.vmport is not None:
+            vmport = config.vmport
+        if config.type in ['kvm', 'packet'] and '.' not in ip:
+            vmport = ip
+            ip = '127.0.0.1'
+        scpcommand = common.scp(name, ip=ip, user=user, source=source, destination=destination, recursive=recursive,
+                                tunnel=tunnel, tunnelhost=tunnelhost, tunnelport=tunnelport, tunneluser=tunneluser,
+                                debug=config.debug, download=download, vmport=vmport, insecure=insecure)
     if scpcommand is not None:
         if find_executable('scp') is not None:
             os.system(scpcommand)
@@ -2099,6 +2387,7 @@ def cli():
     """
 
     """
+    PARAMETERS_HELP = 'specify parameter or keyword for rendering (multiple can be specified)'
     parser = argparse.ArgumentParser(description='Libvirt/Ovirt/Vsphere/Gcp/Aws/Openstack/Kubevirt Wrapper')
     parser.add_argument('-C', '--client')
     parser.add_argument('--containerclient', help='Containerclient to use')
@@ -2117,13 +2406,13 @@ def cli():
     containerconsole_parser.set_defaults(func=console_container)
 
     create_desc = 'Create Object'
-    create_parser = subparsers.add_parser('create', description=create_desc, help=create_desc)
+    create_parser = subparsers.add_parser('create', description=create_desc, help=create_desc, aliases=['add'])
     create_subparsers = create_parser.add_subparsers(metavar='', dest='subcommand_create')
 
     vmclone_desc = 'Clone Vm'
     vmclone_epilog = None
     vmclone_parser = subparsers.add_parser('clone', description=vmclone_desc, help=vmclone_desc, epilog=vmclone_epilog,
-                                           formatter_class=argparse.RawDescriptionHelpFormatter)
+                                           formatter_class=rawhelp)
     vmclone_parser.add_argument('-b', '--base', help='Base VM', metavar='BASE')
     vmclone_parser.add_argument('-f', '--full', action='store_true', help='Full Clone')
     vmclone_parser.add_argument('-s', '--start', action='store_true', help='Start cloned VM')
@@ -2137,7 +2426,7 @@ def cli():
     vmconsole_parser.add_argument('name', metavar='VMNAME', nargs='?')
     vmconsole_parser.set_defaults(func=console_vm)
     subparsers.add_parser('console', parents=[vmconsole_parser], description=vmconsole_desc, help=vmconsole_desc,
-                          epilog=vmconsole_epilog, formatter_class=argparse.RawDescriptionHelpFormatter)
+                          epilog=vmconsole_epilog, formatter_class=rawhelp)
 
     delete_desc = 'Delete Object'
     delete_parser = subparsers.add_parser('delete', description=delete_desc, help=delete_desc, aliases=['remove'])
@@ -2160,7 +2449,7 @@ def cli():
     vmexport_epilog = "examples:\n%s" % vmexport
     vmexport_parser = subparsers.add_parser('export', description=vmexport_desc, help=vmexport_desc,
                                             epilog=vmexport_epilog,
-                                            formatter_class=argparse.RawDescriptionHelpFormatter)
+                                            formatter_class=rawhelp)
     vmexport_parser.add_argument('-i', '--image', help='Name for the generated image. Uses the vm name otherwise',
                                  metavar='IMAGE')
     vmexport_parser.add_argument('names', metavar='VMNAMES', nargs='*')
@@ -2180,7 +2469,7 @@ def cli():
     list_epilog = "examples:\n%s" % _list
     list_parser = subparsers.add_parser('list', description=list_desc, help=list_desc, aliases=['get'],
                                         epilog=list_epilog,
-                                        formatter_class=argparse.RawDescriptionHelpFormatter)
+                                        formatter_class=rawhelp)
     list_subparsers = list_parser.add_subparsers(metavar='', dest='subcommand_list')
 
     render_desc = 'Render Plan/file'
@@ -2191,6 +2480,19 @@ def cli():
                                help='Define parameter for rendering (can specify multiple)', metavar='PARAM')
     render_parser.add_argument('--paramfile', help='Parameters file', metavar='PARAMFILE')
     render_parser.set_defaults(func=render_file)
+
+    userdatacreate_desc = 'Create Cloudinit/Ignition for a single vm or from plan file'
+    userdatacreate_epilog = "examples:\n%s" % userdatacreate
+    userdatacreate_parser = create_subparsers.add_parser('userdata', description=userdatacreate_desc,
+                                                         help=userdatacreate_desc, epilog=userdatacreate_epilog,
+                                                         formatter_class=rawhelp)
+    userdatacreate_parser.add_argument('-i', '--image', help='Image to use', metavar='IMAGE')
+    userdatacreate_parser.add_argument('-f', '--inputfile', help='Input Plan file')
+    userdatacreate_parser.add_argument('-P', '--param', action='append',
+                                       help='Define parameter for rendering (can specify multiple)', metavar='PARAM')
+    userdatacreate_parser.add_argument('--paramfile', help='Parameters file', metavar='PARAMFILE')
+    userdatacreate_parser.add_argument('name', metavar='VMNAME', nargs='?', type=valid_fqdn)
+    userdatacreate_parser.set_defaults(func=create_userdata)
 
     restart_desc = 'Restart Vm/Plan/Container'
     restart_parser = subparsers.add_parser('restart', description=restart_desc, help=restart_desc)
@@ -2209,15 +2511,12 @@ def cli():
     vmscp_parser = argparse.ArgumentParser(add_help=False)
     vmscp_parser.add_argument('-r', '--recursive', help='Recursive', action='store_true')
     vmscp_parser.add_argument('-u', '-l', '--user', help='User for ssh')
+    vmscp_parser.add_argument('-p', '-P', '--port', help='Port for ssh')
     vmscp_parser.add_argument('source', nargs=1)
     vmscp_parser.add_argument('destination', nargs=1)
     vmscp_parser.set_defaults(func=scp_vm)
     subparsers.add_parser('scp', parents=[vmscp_parser], description=vmscp_desc, help=vmscp_desc, epilog=vmscp_epilog,
-                          formatter_class=argparse.RawDescriptionHelpFormatter)
-
-    snapshot_desc = 'Snapshot Vm/Plan'
-    snapshot_parser = subparsers.add_parser('snapshot', description=snapshot_desc, help=snapshot_desc)
-    snapshot_subparsers = snapshot_parser.add_subparsers(metavar='', dest='subcommand_snapshot')
+                          formatter_class=rawhelp)
 
     vmssh_desc = 'Ssh Into Vm'
     vmssh_epilog = None
@@ -2227,16 +2526,17 @@ def cli():
     vmssh_parser.add_argument('-R', help='Remote Forwarding', metavar='REMOTE')
     vmssh_parser.add_argument('-X', action='store_true', help='Enable X11 Forwarding')
     vmssh_parser.add_argument('-Y', action='store_true', help='Enable X11 Forwarding(Insecure)')
+    vmssh_parser.add_argument('-p', '--port', '--port', help='Port for ssh')
     vmssh_parser.add_argument('-u', '-l', '--user', help='User for ssh')
     vmssh_parser.add_argument('name', metavar='VMNAME', nargs='*')
     vmssh_parser.set_defaults(func=ssh_vm)
     subparsers.add_parser('ssh', parents=[vmssh_parser], description=vmssh_desc, help=vmssh_desc, epilog=vmssh_epilog,
-                          formatter_class=argparse.RawDescriptionHelpFormatter)
+                          formatter_class=rawhelp)
 
     start_desc = 'Start Vm/Plan/Container'
     start_epilog = "examples:\n%s" % start
     start_parser = subparsers.add_parser('start', description=start_desc, help=start_desc, epilog=start_epilog,
-                                         formatter_class=argparse.RawDescriptionHelpFormatter)
+                                         formatter_class=rawhelp)
     start_subparsers = start_parser.add_subparsers(metavar='', dest='subcommand_start')
 
     stop_desc = 'Stop Vm/Plan/Container'
@@ -2260,7 +2560,7 @@ def cli():
     version_parser = argparse.ArgumentParser(add_help=False)
     version_parser.set_defaults(func=get_version)
     subparsers.add_parser('version', parents=[version_parser], description=version_desc, help=version_desc,
-                          epilog=version_epilog, formatter_class=argparse.RawDescriptionHelpFormatter)
+                          epilog=version_epilog, formatter_class=rawhelp)
 
     # sub subcommands
     cachedelete_desc = 'Delete Cache'
@@ -2268,11 +2568,102 @@ def cli():
     cachedelete_parser.add_argument('-y', '--yes', action='store_true', help='Dont ask for confirmation')
     cachedelete_parser.set_defaults(func=delete_cache)
 
+    createapp_desc = 'Create Kube Apps'
+    createapp_parser = create_subparsers.add_parser('app', description=createapp_desc,
+                                                    help=createapp_desc, aliases=['apps'])
+    createapp_subparsers = createapp_parser.add_subparsers(metavar='', dest='subcommand_create_app')
+
+    appgenericcreate_desc = 'Create Kube App Generic'
+    appgenericcreate_epilog = None
+    appgenericcreate_parser = createapp_subparsers.add_parser('generic', description=appgenericcreate_desc,
+                                                              help=appgenericcreate_desc,
+                                                              epilog=appgenericcreate_epilog, formatter_class=rawhelp)
+    appgenericcreate_parser.add_argument('-P', '--param', action='append',
+                                         help='specify parameter or keyword for rendering (multiple can be specified)',
+                                         metavar='PARAM')
+    appgenericcreate_parser.add_argument('--paramfile', help='Parameters file', metavar='PARAMFILE')
+    appgenericcreate_parser.add_argument('apps', metavar='APPS', nargs='*')
+    appgenericcreate_parser.set_defaults(func=create_app_generic)
+
+    appopenshiftcreate_desc = 'Create Kube App Openshift'
+    appopenshiftcreate_epilog = None
+    appopenshiftcreate_parser = createapp_subparsers.add_parser('openshift', description=appopenshiftcreate_desc,
+                                                                help=appopenshiftcreate_desc,
+                                                                epilog=appopenshiftcreate_epilog,
+                                                                formatter_class=rawhelp)
+    appopenshiftcreate_parser.add_argument('-P', '--param', action='append',
+                                           help=PARAMETERS_HELP, metavar='PARAM')
+    appopenshiftcreate_parser.add_argument('--paramfile', help='Parameters file', metavar='PARAMFILE')
+    appopenshiftcreate_parser.add_argument('apps', metavar='APPS', nargs='*')
+    appopenshiftcreate_parser.set_defaults(func=create_app_openshift)
+
+    deleteapp_desc = 'Delete Kube App'
+    deleteapp_parser = delete_subparsers.add_parser('app', description=deleteapp_desc,
+                                                    help=deleteapp_desc, aliases=['apps'])
+    deleteapp_subparsers = deleteapp_parser.add_subparsers(metavar='', dest='subcommand_delete_app')
+
+    appgenericdelete_desc = 'Delete Kube App Generic'
+    appgenericdelete_epilog = None
+    appgenericdelete_parser = deleteapp_subparsers.add_parser('generic', description=appgenericdelete_desc,
+                                                              help=appgenericdelete_desc,
+                                                              epilog=appgenericdelete_epilog, formatter_class=rawhelp)
+    appgenericdelete_parser.add_argument('-P', '--param', action='append',
+                                         help=PARAMETERS_HELP,
+                                         metavar='PARAM')
+    appgenericdelete_parser.add_argument('--paramfile', help='Parameters file', metavar='PARAMFILE')
+    appgenericdelete_parser.add_argument('apps', metavar='APPS', nargs='*')
+    appgenericdelete_parser.set_defaults(func=delete_app_generic)
+
+    appopenshiftdelete_desc = 'Delete Kube App Openshift'
+    appopenshiftdelete_epilog = None
+    appopenshiftdelete_parser = deleteapp_subparsers.add_parser('openshift', description=appopenshiftdelete_desc,
+                                                                help=appopenshiftdelete_desc,
+                                                                epilog=appopenshiftdelete_epilog,
+                                                                formatter_class=rawhelp)
+    appopenshiftdelete_parser.add_argument('-P', '--param', action='append',
+                                           help=PARAMETERS_HELP,
+                                           metavar='PARAM')
+    appopenshiftdelete_parser.add_argument('--paramfile', help='Parameters file', metavar='PARAMFILE')
+    appopenshiftdelete_parser.add_argument('apps', metavar='APPS', nargs='*')
+    appopenshiftdelete_parser.set_defaults(func=delete_app_openshift)
+
+    appinfo_desc = 'Info App'
+    appinfo_parser = info_subparsers.add_parser('app', description=appinfo_desc, help=appinfo_desc)
+    appinfo_subparsers = appinfo_parser.add_subparsers(metavar='', dest='subcommand_info_app')
+
+    appgenericinfo_desc = 'Info Generic App'
+    appgenericinfo_parser = appinfo_subparsers.add_parser('generic', description=appgenericinfo_desc,
+                                                          help=appgenericinfo_desc)
+
+    appgenericinfo_parser.add_argument('app', metavar='APP')
+    appgenericinfo_parser.set_defaults(func=info_generic_app)
+
+    appopenshiftinfo_desc = 'Info Openshift App'
+    appopenshiftinfo_parser = appinfo_subparsers.add_parser('openshift', description=appopenshiftinfo_desc,
+                                                            help=appopenshiftinfo_desc)
+    appopenshiftinfo_parser.add_argument('app', metavar='APP')
+    appopenshiftinfo_parser.set_defaults(func=info_openshift_app)
+
+    listapp_desc = 'List Available Kube Apps'
+    listapp_parser = list_subparsers.add_parser('app', description=listapp_desc,
+                                                help=listapp_desc, aliases=['apps'])
+    listapp_subparsers = listapp_parser.add_subparsers(metavar='', dest='subcommand_list_app')
+
+    appgenericlist_desc = 'List Available Kube Apps Generic'
+    appgenericlist_parser = listapp_subparsers.add_parser('generic', description=appgenericlist_desc,
+                                                          help=appgenericlist_desc)
+    appgenericlist_parser.set_defaults(func=list_apps_generic)
+
+    appopenshiftlist_desc = 'List Available Kube Components Openshift'
+    appopenshiftlist_parser = listapp_subparsers.add_parser('openshift', description=appopenshiftlist_desc,
+                                                            help=appopenshiftlist_desc)
+    appopenshiftlist_parser.set_defaults(func=list_apps_openshift)
+
     containercreate_desc = 'Create Container'
     containercreate_epilog = None
     containercreate_parser = create_subparsers.add_parser('container', description=containercreate_desc,
                                                           help=containercreate_desc, epilog=containercreate_epilog,
-                                                          formatter_class=argparse.RawDescriptionHelpFormatter)
+                                                          formatter_class=rawhelp)
     containercreate_parser_group = containercreate_parser.add_mutually_exclusive_group(required=True)
     containercreate_parser_group.add_argument('-i', '--image', help='Image to use', metavar='Image')
     containercreate_parser_group.add_argument('-p', '--profile', help='Profile to use', metavar='PROFILE')
@@ -2331,7 +2722,7 @@ def cli():
     dnscreate_epilog = "examples:\n%s" % dnscreate
     dnscreate_parser = create_subparsers.add_parser('dns', description=dnscreate_desc, help=dnscreate_desc,
                                                     epilog=dnscreate_epilog,
-                                                    formatter_class=argparse.RawDescriptionHelpFormatter)
+                                                    formatter_class=rawhelp)
     dnscreate_parser.add_argument('-a', '--alias', action='append', help='specify alias (can specify multiple)',
                                   metavar='ALIAS')
     dnscreate_parser.add_argument('-d', '--domain', help='Domain where to create entry', metavar='DOMAIN')
@@ -2360,7 +2751,7 @@ def cli():
     hostcreate_epilog = "examples:\n%s" % hostcreate
     hostcreate_parser = create_subparsers.add_parser('host', help=hostcreate_desc, description=hostcreate_desc,
                                                      aliases=['client'], epilog=hostcreate_epilog,
-                                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+                                                     formatter_class=rawhelp)
     hostcreate_subparsers = hostcreate_parser.add_subparsers(metavar='', dest='subcommand_create_host')
 
     awshostcreate_desc = 'Create Aws Host'
@@ -2371,7 +2762,7 @@ def cli():
                                       required=True)
     awshostcreate_parser.add_argument('-k', '--keypair', help='Keypair', metavar='KEYPAIR', required=True)
     awshostcreate_parser.add_argument('-r', '--region', help='Region', metavar='REGION', required=True)
-    awshostcreate_parser.add_argument('name', metavar='NAME', nargs='?')
+    awshostcreate_parser.add_argument('name', metavar='NAME')
     awshostcreate_parser.set_defaults(func=create_host_aws)
 
     gcphostcreate_desc = 'Create Gcp Host'
@@ -2380,7 +2771,7 @@ def cli():
     gcphostcreate_parser.add_argument('--credentials', help='Path to credentials file', metavar='credentials')
     gcphostcreate_parser.add_argument('--project', help='Project', metavar='project', required=True)
     gcphostcreate_parser.add_argument('--zone', help='Zone', metavar='zone', required=True)
-    gcphostcreate_parser.add_argument('name', metavar='NAME', nargs='?')
+    gcphostcreate_parser.add_argument('name', metavar='NAME')
     gcphostcreate_parser.set_defaults(func=create_host_gcp)
 
     kvmhostcreate_desc = 'Create Kvm Host'
@@ -2394,7 +2785,7 @@ def cli():
     kvmhostcreate_parser.add_argument('-P', '--protocol', help='Protocol to use', default='ssh', metavar='PROTOCOL')
     kvmhostcreate_parser_group.add_argument('-U', '--url', help='URL to use', metavar='URL')
     kvmhostcreate_parser.add_argument('-u', '--user', help='User. Defaults to root', default='root', metavar='USER')
-    kvmhostcreate_parser.add_argument('name', metavar='NAME', nargs='?')
+    kvmhostcreate_parser.add_argument('name', metavar='NAME')
     kvmhostcreate_parser.set_defaults(func=create_host_kvm)
 
     kubevirthostcreate_desc = 'Create Kubevirt Host'
@@ -2408,18 +2799,18 @@ def cli():
     kubevirthostcreate_parser.add_argument('--port', help='Api Port', metavar='HOST')
     kubevirthostcreate_parser.add_argument('--token', help='Token', metavar='TOKEN')
     kubevirthostcreate_parser.add_argument('--multus', help='Multus Support', action='store_true', default=True)
-    kubevirthostcreate_parser.add_argument('name', metavar='NAME', nargs='?')
+    kubevirthostcreate_parser.add_argument('name', metavar='NAME')
     kubevirthostcreate_parser.set_defaults(func=create_host_kubevirt)
 
     openstackhostcreate_desc = 'Create Openstack Host'
     openstackhostcreate_parser = hostcreate_subparsers.add_parser('openstack', help=openstackhostcreate_desc,
                                                                   description=openstackhostcreate_desc)
-    openstackhostcreate_parser.add_argument('-auth-url', help='Auth url', metavar='AUTH_URL', required=True)
-    openstackhostcreate_parser.add_argument('-domain', help='Domain', metavar='DOMAIN', default='Default')
+    openstackhostcreate_parser.add_argument('--auth-url', help='Auth url', metavar='AUTH_URL', required=True)
+    openstackhostcreate_parser.add_argument('--domain', help='Domain', metavar='DOMAIN', default='Default')
     openstackhostcreate_parser.add_argument('-p', '--password', help='Password', metavar='PASSWORD', required=True)
-    openstackhostcreate_parser.add_argument('-project', help='Project', metavar='PROJECT', required=True)
+    openstackhostcreate_parser.add_argument('--project', help='Project', metavar='PROJECT', required=True)
     openstackhostcreate_parser.add_argument('-u', '--user', help='User', metavar='USER', required=True)
-    openstackhostcreate_parser.add_argument('name', metavar='NAME', nargs='?')
+    openstackhostcreate_parser.add_argument('name', metavar='NAME')
     openstackhostcreate_parser.set_defaults(func=create_host_openstack)
 
     ovirthostcreate_desc = 'Create Ovirt Host'
@@ -2436,7 +2827,7 @@ def cli():
     ovirthostcreate_parser.add_argument('--pool', help='Storage Domain', metavar='POOL')
     ovirthostcreate_parser.add_argument('-u', '--user', help='User. Defaults to admin@internal',
                                         metavar='USER', default='admin@internal')
-    ovirthostcreate_parser.add_argument('name', metavar='NAME', nargs='?')
+    ovirthostcreate_parser.add_argument('name', metavar='NAME')
     ovirthostcreate_parser.set_defaults(func=create_host_ovirt)
 
     vspherehostcreate_desc = 'Create Vsphere Host'
@@ -2447,13 +2838,14 @@ def cli():
     vspherehostcreate_parser.add_argument('-H', '--host', help='Vcenter Host', metavar='HOST', required=True)
     vspherehostcreate_parser.add_argument('-p', '--password', help='Password', metavar='PASSWORD', required=True)
     vspherehostcreate_parser.add_argument('-u', '--user', help='User', metavar='USER', required=True)
-    vspherehostcreate_parser.add_argument('name', metavar='NAME', nargs='?')
+    vspherehostcreate_parser.add_argument('--pool', help='Pool', metavar='POOL')
+    vspherehostcreate_parser.add_argument('name', metavar='NAME')
     vspherehostcreate_parser.set_defaults(func=create_host_vsphere)
 
     hostdelete_desc = 'Delete Host'
     hostdelete_parser = delete_subparsers.add_parser('host', description=hostdelete_desc, help=hostdelete_desc,
                                                      aliases=['client'])
-    hostdelete_parser.add_argument('name', metavar='NAME', nargs='?')
+    hostdelete_parser.add_argument('name', metavar='NAME')
     hostdelete_parser.set_defaults(func=delete_host)
 
     hostdisable_desc = 'Disable Host'
@@ -2509,7 +2901,7 @@ def cli():
                                      description=kubegenericcreate_desc,
                                      help=kubegenericcreate_desc,
                                      epilog=kubegenericcreate_epilog,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+                                     formatter_class=rawhelp)
 
     kubek3screate_desc = 'Create K3s Kube'
     kubek3screate_epilog = "examples:\n%s" % kubek3screate
@@ -2525,7 +2917,7 @@ def cli():
                                      description=kubek3screate_desc,
                                      help=kubek3screate_desc,
                                      epilog=kubek3screate_epilog,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+                                     formatter_class=rawhelp)
 
     parameterhelp = "specify parameter or keyword for rendering (multiple can be specified)"
     kubeopenshiftcreate_desc = 'Create Openshift Kube'
@@ -2540,7 +2932,7 @@ def cli():
                                      description=kubeopenshiftcreate_desc,
                                      help=kubeopenshiftcreate_desc,
                                      epilog=kubeopenshiftcreate_epilog,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter, aliases=['okd'])
+                                     formatter_class=rawhelp, aliases=['okd'])
 
     kubedelete_desc = 'Delete Kube'
     kubedelete_parser = argparse.ArgumentParser(add_help=False)
@@ -2648,6 +3040,11 @@ def cli():
     create_subparsers.add_parser('profile', parents=[profilecreate_parser], description=profilecreate_desc,
                                  help=profilecreate_desc)
 
+    profileinfo_desc = 'Info Profile'
+    profileinfo_parser = info_subparsers.add_parser('profile', description=profileinfo_desc, help=profileinfo_desc)
+    profileinfo_parser.add_argument('profile', metavar='PROFILE')
+    profileinfo_parser.set_defaults(func=info_profile)
+
     profilelist_desc = 'List Profiles'
     profilelist_parser = list_subparsers.add_parser('profile', description=profilelist_desc, help=profilelist_desc,
                                                     aliases=['profiles'])
@@ -2710,7 +3107,7 @@ def cli():
     networkdelete_parser = delete_subparsers.add_parser('network', description=networkdelete_desc,
                                                         help=networkdelete_desc)
     networkdelete_parser.add_argument('-y', '--yes', action='store_true', help='Dont ask for confirmation')
-    networkdelete_parser.add_argument('name', metavar='NETWORK', nargs='+')
+    networkdelete_parser.add_argument('names', metavar='NETWORKS', nargs='+')
     networkdelete_parser.set_defaults(func=delete_network)
 
     pipelinecreate_desc = 'Create Pipeline'
@@ -2727,7 +3124,7 @@ def cli():
     plancreate_epilog = "examples:\n%s" % plancreate
     plancreate_parser = create_subparsers.add_parser('plan', description=plancreate_desc, help=plancreate_desc,
                                                      epilog=plancreate_epilog,
-                                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+                                                     formatter_class=rawhelp)
     plancreate_parser.add_argument('-A', '--ansible', help='Generate ansible inventory', action='store_true')
     plancreate_parser.add_argument('-u', '--url', help='Url for plan', metavar='URL')
     plancreate_parser.add_argument('-p', '--path', help='Path where to download plans. Defaults to plan',
@@ -2748,28 +3145,35 @@ def cli():
     plandelete_parser.add_argument('plan', metavar='PLAN')
     plandelete_parser.set_defaults(func=delete_plan)
 
+    plansnapshotdelete_desc = 'Deletw Plan Snapshot'
+    plansnapshotdelete_parser = delete_subparsers.add_parser('plan-snapshot', description=plansnapshotdelete_desc,
+                                                             help=plansnapshotdelete_desc)
+    plansnapshotdelete_parser.add_argument('-p', '--plan', help='plan name', required=True, metavar='PLAN')
+    plansnapshotdelete_parser.add_argument('snapshot', metavar='SNAPSHOT')
+    plansnapshotdelete_parser.set_defaults(func=delete_snapshot_plan)
+
     planexpose_desc = 'Expose plan'
     planexpose_epilog = None
     planexpose_parser = argparse.ArgumentParser(add_help=False)
     planexpose_parser.add_argument('-f', '--inputfile', help='Input Plan file')
     planexpose_parser.add_argument('-P', '--param', action='append',
                                    help='Define parameter for rendering (can specify multiple)', metavar='PARAM')
-    planexpose_parser.add_argument('plan', metavar='PLAN')
+    planexpose_parser.add_argument('--port', help='Port where to listen', type=int, default=9000, metavar='PORT')
+    planexpose_parser.add_argument('plan', metavar='PLAN', nargs='?')
     planexpose_parser.set_defaults(func=expose_plan)
     expose_subparsers.add_parser('plan', parents=[planexpose_parser], description=vmssh_desc, help=planexpose_desc,
-                                 epilog=planexpose_epilog, formatter_class=argparse.RawDescriptionHelpFormatter)
+                                 epilog=planexpose_epilog, formatter_class=rawhelp)
 
     planinfo_desc = 'Info Plan'
     planinfo_epilog = "examples:\n%s" % planinfo
     planinfo_parser = info_subparsers.add_parser('plan', description=planinfo_desc, help=planinfo_desc,
                                                  epilog=planinfo_epilog,
-                                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+                                                 formatter_class=rawhelp)
     planinfo_parser.add_argument('--doc', action='store_true', help='Render info as markdown table')
     planinfo_parser.add_argument('-f', '--inputfile', help='Input Plan file')
     planinfo_parser.add_argument('-p', '--path', help='Path where to download plans. Defaults to plan', metavar='PATH')
     planinfo_parser.add_argument('-q', '--quiet', action='store_true', help='Provide parameter file output')
     planinfo_parser.add_argument('-u', '--url', help='Url for plan', metavar='URL')
-    planinfo_parser.add_argument('plan', metavar='PLAN', nargs='?')
     planinfo_parser.set_defaults(func=info_plan)
 
     planlist_desc = 'List Plans'
@@ -2779,27 +3183,32 @@ def cli():
 
     planrestart_desc = 'Restart Plan'
     planrestart_parser = restart_subparsers.add_parser('plan', description=planrestart_desc, help=planrestart_desc)
-    planrestart_parser.add_argument('plan', metavar='PLAN', nargs='?')
+    planrestart_parser.add_argument('plan', metavar='PLAN')
     planrestart_parser.set_defaults(func=restart_plan)
 
     planrevert_desc = 'Revert Snapshot Of Plan'
-    planrevert_parser = revert_subparsers.add_parser('plan', description=planrevert_desc, help=planrevert_desc)
-    planrevert_parser.add_argument('plan', metavar='PLAN', nargs='?')
-    planrevert_parser.set_defaults(func=revert_plan)
+    planrevert_parser = revert_subparsers.add_parser('plan-snapshot', description=planrevert_desc, help=planrevert_desc,
+                                                     aliases=['plan'])
+    planrevert_parser.add_argument('-p', '--plan', help='Plan name', required=True, metavar='PLANNAME')
+    planrevert_parser.add_argument('snapshot', metavar='SNAPSHOT')
+    planrevert_parser.set_defaults(func=revert_snapshot_plan)
 
-    plansnapshot_desc = 'Snapshot Plan'
-    plansnapshot_parser = snapshot_subparsers.add_parser('plan', description=plansnapshot_desc, help=plansnapshot_desc)
-    plansnapshot_parser.add_argument('plan', metavar='PLAN', nargs='?')
-    plansnapshot_parser.set_defaults(func=snapshot_plan)
+    plansnapshotcreate_desc = 'Create Plan Snapshot'
+    plansnapshotcreate_parser = create_subparsers.add_parser('plan-snapshot', description=plansnapshotcreate_desc,
+                                                             help=plansnapshotcreate_desc)
+
+    plansnapshotcreate_parser.add_argument('-p', '--plan', help='plan name', required=True, metavar='PLAN')
+    plansnapshotcreate_parser.add_argument('snapshot', metavar='SNAPSHOT')
+    plansnapshotcreate_parser.set_defaults(func=create_snapshot_plan)
 
     planstart_desc = 'Start Plan'
     planstart_parser = start_subparsers.add_parser('plan', description=planstart_desc, help=planstart_desc)
-    planstart_parser.add_argument('plan', metavar='PLAN', nargs='?')
+    planstart_parser.add_argument('plan', metavar='PLAN')
     planstart_parser.set_defaults(func=start_plan)
 
     planstop_desc = 'Stop Plan'
     planstop_parser = stop_subparsers.add_parser('plan', description=planstop_desc, help=planstop_desc)
-    planstop_parser.add_argument('plan', metavar='PLAN', nargs='?')
+    planstop_parser.add_argument('plan', metavar='PLAN')
     planstop_parser.set_defaults(func=stop_plan)
 
     planupdate_desc = 'Update Plan'
@@ -2814,7 +3223,7 @@ def cli():
     planupdate_parser.add_argument('-P', '--param', action='append',
                                    help='Define parameter for rendering (can specify multiple)', metavar='PARAM')
     planupdate_parser.add_argument('--paramfile', help='Parameters file', metavar='PARAMFILE')
-    planupdate_parser.add_argument('plan', metavar='PLAN', nargs='?')
+    planupdate_parser.add_argument('plan', metavar='PLAN')
     planupdate_parser.set_defaults(func=update_plan)
 
     poolcreate_desc = 'Create Pool'
@@ -2869,7 +3278,7 @@ def cli():
     productinfo_parser.add_argument('product', metavar='PRODUCT')
     info_subparsers.add_parser('product', parents=[productinfo_parser], description=productinfo_desc,
                                help=productinfo_desc,
-                               epilog=productinfo_epilog, formatter_class=argparse.RawDescriptionHelpFormatter)
+                               epilog=productinfo_epilog, formatter_class=rawhelp)
 
     productlist_desc = 'List Products'
     productlist_parser = list_subparsers.add_parser('product', description=productlist_desc, help=productlist_desc,
@@ -2885,7 +3294,7 @@ def cli():
     repocreate_epilog = "examples:\n%s" % repocreate
     repocreate_parser = create_subparsers.add_parser('repo', description=repocreate_desc, help=repocreate_desc,
                                                      epilog=repocreate_epilog,
-                                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+                                                     formatter_class=rawhelp)
     repocreate_parser.add_argument('-u', '--url', help='URL of the repo', metavar='URL')
     repocreate_parser.add_argument('repo')
     repocreate_parser.set_defaults(func=create_repo)
@@ -2914,7 +3323,7 @@ def cli():
     delete_subparsers.add_parser('image', parents=[imagedelete_parser], description=imagedelete_desc,
                                  help=imagedelete_desc)
 
-    imagedownload_desc = 'Download Cloud Image/Iso'
+    imagedownload_desc = 'Download Cloud Image'
     imagedownload_help = "Image to download. Choose between \n%s" % '\n'.join(IMAGES.keys())
     imagedownload_parser = argparse.ArgumentParser(add_help=False)
     imagedownload_parser.add_argument('-c', '--cmd', help='Extra command to launch after downloading', metavar='CMD')
@@ -2924,7 +3333,16 @@ def cli():
     imagedownload_parser.add_argument('image', help=imagedownload_help, metavar='IMAGE')
     imagedownload_parser.set_defaults(func=download_image)
     download_subparsers.add_parser('image', parents=[imagedownload_parser], description=imagedownload_desc,
-                                   help=imagedownload_desc, aliases=['iso'])
+                                   help=imagedownload_desc)
+
+    isodownload_desc = 'Download Iso'
+    isodownload_help = "Iso url"
+    isodownload_parser = argparse.ArgumentParser(add_help=False)
+    isodownload_parser.add_argument('-p', '--pool', help='Pool to use. Defaults to default', metavar='POOL')
+    isodownload_parser.add_argument('iso', help=isodownload_help, metavar='ISO')
+    isodownload_parser.set_defaults(func=download_iso)
+    download_subparsers.add_parser('iso', parents=[isodownload_parser], description=isodownload_desc,
+                                   help=isodownload_desc)
 
     okddownload_desc = 'Download Okd Installer'
     okddownload_parser = argparse.ArgumentParser(add_help=False)
@@ -2994,7 +3412,7 @@ def cli():
     vmcreate_parser.add_argument('name', metavar='VMNAME', nargs='?', type=valid_fqdn)
     vmcreate_parser.set_defaults(func=create_vm)
     create_subparsers.add_parser('vm', parents=[vmcreate_parser], description=vmcreate_desc, help=vmcreate_desc,
-                                 epilog=vmcreate_epilog, formatter_class=argparse.RawDescriptionHelpFormatter)
+                                 epilog=vmcreate_epilog, formatter_class=rawhelp)
 
     vmdelete_desc = 'Delete Vm'
     vmdelete_parser = argparse.ArgumentParser(add_help=False)
@@ -3017,7 +3435,7 @@ def cli():
     vmdiskadd_parser.set_defaults(func=create_vmdisk)
     create_subparsers.add_parser('disk', parents=[vmdiskadd_parser], description=vmdiskadd_desc, help=vmdiskadd_desc,
                                  aliases=['vm-disk'], epilog=diskcreate_epilog,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+                                 formatter_class=rawhelp)
 
     vmdiskdelete_desc = 'Delete Vm Disk'
     diskdelete_epilog = "examples:\n%s" % diskdelete
@@ -3028,7 +3446,7 @@ def cli():
     vmdiskdelete_parser.set_defaults(func=delete_vmdisk)
     delete_subparsers.add_parser('disk', parents=[vmdiskdelete_parser], description=vmdiskdelete_desc,
                                  aliases=['vm-disk'], help=vmdiskdelete_desc, epilog=diskdelete_epilog,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+                                 formatter_class=rawhelp)
 
     vmdisklist_desc = 'List All Vm Disks'
     vmdisklist_parser = argparse.ArgumentParser(add_help=False)
@@ -3061,7 +3479,7 @@ def cli():
     create_vmnic_parser.set_defaults(func=create_vmnic)
     create_subparsers.add_parser('nic', parents=[create_vmnic_parser], description=create_vmnic_desc,
                                  help=create_vmnic_desc, aliases=['vm-nic'],
-                                 epilog=create_vmnic_epilog, formatter_class=argparse.RawDescriptionHelpFormatter)
+                                 epilog=create_vmnic_epilog, formatter_class=rawhelp)
 
     delete_vmnic_desc = 'Delete Nic From vm'
     delete_vmnic_epilog = "examples:\n%s" % nicdelete
@@ -3072,7 +3490,7 @@ def cli():
     delete_vmnic_parser.set_defaults(func=delete_vmnic)
     delete_subparsers.add_parser('nic', parents=[delete_vmnic_parser], description=delete_vmnic_desc,
                                  help=delete_vmnic_desc, aliases=['vm-nic'],
-                                 epilog=delete_vmnic_epilog, formatter_class=argparse.RawDescriptionHelpFormatter)
+                                 epilog=delete_vmnic_epilog, formatter_class=rawhelp)
 
     vmrestart_desc = 'Restart Vms'
     vmrestart_parser = restart_subparsers.add_parser('vm', description=vmrestart_desc, help=vmrestart_desc)
@@ -3101,9 +3519,8 @@ def cli():
 
     vmsnapshotrevert_desc = 'Revert Snapshot Of Vm'
     vmsnapshotrevert_parser = revert_subparsers.add_parser('vm-snapshot', description=vmsnapshotrevert_desc,
-                                                           help=vmsnapshotrevert_desc)
-    vmsnapshotrevert_parser.add_argument('-n', '--name', help='Use vm name for creation/revert/delete',
-                                         required=True, metavar='VMNAME')
+                                                           help=vmsnapshotrevert_desc, aliases=['vm'])
+    vmsnapshotrevert_parser.add_argument('-n', '--name', help='vm name', required=True, metavar='VMNAME')
     vmsnapshotrevert_parser.add_argument('snapshot')
     vmsnapshotrevert_parser.set_defaults(func=snapshotrevert_vm)
 

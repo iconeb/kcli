@@ -1,18 +1,29 @@
 #!/usr/bin/env python
 
 from distutils.spawn import find_executable
-from kvirt.common import info, pprint, pwd_path, get_kubectl
+from kvirt.common import info, pprint, get_kubectl, scp
 import os
 import sys
+import yaml
 
 cloudplatforms = ['aws', 'gcp']
 
 
 def scale(config, plandir, cluster, overrides):
-    data = {'cluster': cluster}
-    data.update(overrides)
+    plan = cluster
+    data = {'cluster': cluster, 'kube': cluster, 'kubetype': 'k3s'}
     data['basedir'] = '/workdir' if os.path.exists("/i_am_a_container") else '.'
     cluster = data.get('cluster')
+    clusterdir = os.path.expanduser("~/.kcli/clusters/%s" % cluster)
+    if not os.path.exists(clusterdir):
+        pprint("Cluster directory %s not found..." % clusterdir, color='red')
+        sys.exit(1)
+    if os.path.exists("%s/kcli_parameters.yml" % clusterdir):
+        with open("%s/kcli_parameters.yml" % clusterdir, 'r') as install:
+            installparam = yaml.safe_load(install)
+            data.update(installparam)
+            plan = installparam.get('plan', plan)
+    data.update(overrides)
     client = config.client
     k = config.k
     pprint("Scaling on client %s" % client, color='blue')
@@ -23,14 +34,16 @@ def scale(config, plandir, cluster, overrides):
     else:
         pprint("Using image %s" % image, color='blue')
     data['image'] = image
-    config.plan(cluster, inputfile='%s/workers.yml' % plandir, overrides=data)
+    os.chdir(os.path.expanduser("~/.kcli"))
+    config.plan(plan, inputfile='%s/workers.yml' % plandir, overrides=data)
 
 
 def create(config, plandir, cluster, overrides):
     platform = config.type
     data = {'kubetype': 'k3s'}
     data.update(overrides)
-    data['cluster'] = overrides['cluster'] if 'cluster' in overrides else cluster
+    data['cluster'] = overrides.get('cluster', cluster if cluster is not None else 'testk')
+    plan = cluster if cluster is not None else data['cluster']
     data['kube'] = data['cluster']
     masters = data.get('masters', 1)
     network = data.get('network', 'default')
@@ -52,7 +65,7 @@ def create(config, plandir, cluster, overrides):
         os._exit(1)
     data['basedir'] = '/workdir' if os.path.exists("/i_am_a_container") else '.'
     cluster = data.get('cluster')
-    clusterdir = pwd_path("clusters/%s" % cluster)
+    clusterdir = os.path.expanduser("~/.kcli/clusters/%s" % cluster)
     firstmaster = "%s-master-0" % cluster
     if os.path.exists(clusterdir):
         pprint("Please remove existing directory %s first..." % clusterdir, color='red')
@@ -62,10 +75,14 @@ def create(config, plandir, cluster, overrides):
     if not os.path.exists(clusterdir):
         os.makedirs(clusterdir)
         os.mkdir("%s/auth" % clusterdir)
+        with open("%s/kcli_parameters.yml" % clusterdir, 'w') as p:
+            installparam = overrides.copy()
+            installparam['plan'] = plan
+            yaml.safe_dump(installparam, p, default_flow_style=False, encoding='utf-8', allow_unicode=True)
     if masters > 1:
         datastore_endpoint = data.get('datastore_endpoint')
         if datastore_endpoint is None:
-            result = config.plan(cluster, inputfile='%s/datastore.yml' % plandir, overrides=data, wait=True)
+            result = config.plan(plan, inputfile='%s/datastore.yml' % plandir, overrides=data, wait=True)
             if result['result'] != "success":
                 os._exit(1)
             datastore_type = data['datastore_type']
@@ -83,20 +100,22 @@ def create(config, plandir, cluster, overrides):
     if result['result'] != "success":
         os._exit(1)
     source, destination = "/root/join.sh", "%s/join.sh" % clusterdir
-    scpcmd = k.scp(firstmaster, user='root', source=source, destination=destination, tunnel=config.tunnel,
-                   tunnelhost=config.tunnelhost, tunnelport=config.tunnelport, tunneluser=config.tunneluser,
-                   download=True, insecure=True)
+    firstmasterip = k.info(firstmaster)['ip']
+    scpcmd = scp(firstmaster, ip=firstmasterip, user='root', source=source, destination=destination,
+                 tunnel=config.tunnel, tunnelhost=config.tunnelhost, tunnelport=config.tunnelport,
+                 tunneluser=config.tunneluser, download=True, insecure=True)
     os.system(scpcmd)
     source, destination = "/root/kubeconfig", "%s/auth/kubeconfig" % clusterdir
-    scpcmd = k.scp(firstmaster, user='root', source=source, destination=destination, tunnel=config.tunnel,
-                   tunnelhost=config.tunnelhost, tunnelport=config.tunnelport, tunneluser=config.tunneluser,
-                   download=True, insecure=True)
+    scpcmd = scp(firstmaster, ip=firstmasterip, user='root', source=source, destination=destination,
+                 tunnel=config.tunnel, tunnelhost=config.tunnelhost, tunnelport=config.tunnelport,
+                 tunneluser=config.tunneluser, download=True, insecure=True)
     os.system(scpcmd)
     workers = data.get('workers', 0)
     if workers > 0:
         pprint("Deploying workers", color='blue')
         if 'name' in data:
             del data['name']
+        os.chdir(os.path.expanduser("~/.kcli"))
         config.plan(cluster, inputfile='%s/workers.yml' % plandir, overrides=data)
     pprint("K3s cluster %s deployed!!!" % cluster)
     info("export KUBECONFIG=clusters/%s/auth/kubeconfig" % cluster)

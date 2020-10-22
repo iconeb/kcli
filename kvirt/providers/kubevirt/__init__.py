@@ -9,7 +9,7 @@ from kubernetes import client
 from kvirt.kubecommon import Kubecommon
 from netaddr import IPAddress
 from kvirt import common
-from kvirt.defaults import IMAGES, UBUNTUS
+from kvirt.defaults import IMAGES, UBUNTUS, METADATA_FIELDS
 import datetime
 import os
 import time
@@ -35,13 +35,12 @@ class Kubevirt(Kubecommon):
     """
 
     """
-    def __init__(self, token=None, ca_file=None, context=None, multus=True, host='127.0.0.1', port=443,
-                 user='root', debug=False, tags=None, namespace=None, cdi=False, datavolumes=True, readwritemany=False):
+    def __init__(self, token=None, ca_file=None, context=None, host='127.0.0.1', port=443, user='root', debug=False,
+                 tags=None, namespace=None, cdi=False, datavolumes=True, readwritemany=False):
         Kubecommon.__init__(self, token=token, ca_file=ca_file, context=context, host=host, port=port,
                             namespace=namespace, readwritemany=readwritemany)
         self.crds = client.CustomObjectsApi(api_client=self.api_client)
         self.debug = debug
-        self.multus = multus
         self.tags = tags
         self.cdi = False
         self.datavolumes = False
@@ -95,10 +94,10 @@ class Kubevirt(Kubecommon):
                disks=[{'size': 10}], disksize=10, diskthin=True, diskinterface='virtio', nets=['default'], iso=None,
                vnc=False, cloudinit=True, reserveip=False, reservedns=False, reservehost=False, start=True, keys=None,
                cmds=[], ips=None, netmasks=None, gateway=None, nested=True, dns=None, domain=None, tunnel=False,
-               files=[], enableroot=True, alias=[], overrides={}, tags=[], dnsclient=None, storemetadata=False,
+               files=[], enableroot=True, alias=[], overrides={}, tags=[], storemetadata=False,
                sharedfolders=[], kernel=None, initrd=None, cmdline=None, placement=[], autostart=False,
                cpuhotplug=False, memoryhotplug=False, numamode=None, numa=[], pcidevices=[], tpm=False, rng=False,
-               kube=None, kubetype=None):
+               metadata={}):
         guestagent = False
         if self.exists(name):
             return {'result': 'failure', 'reason': "VM %s already exists" % name}
@@ -147,16 +146,10 @@ class Kubevirt(Kubecommon):
               'apiVersion': 'kubevirt.io/%s' % VERSION, 'metadata': {'name': name, 'namespace': namespace,
                                                                      'labels': {'kubevirt.io/os': 'linux',
                                                                                 'special': 'vmi-migratable'},
-                                                                     'annotations': {'kcli/plan': plan,
-                                                                                     'kcli/profile': profile,
-                                                                                     'kcli/image': image}}}
-        if dnsclient is not None:
-            vm['metadata']['annotations']['kcli/dnsclient'] = dnsclient
-        if kube is not None and kubetype is not None:
-            vm['metadata']['annotations']['kcli/kube'] = kube
-            vm['metadata']['annotations']['kcli/kubetype'] = kubetype
+                                                                     'annotations': {}}}
+        for entry in [field for field in metadata if field in METADATA_FIELDS]:
+            vm['metadata']['annotations']['kcli/%s' % entry] = metadata[entry]
         if domain is not None:
-            vm['metadata']['annotations']['kcli/domain'] = domain
             if reservedns:
                 vm['spec']['template']['spec']['hostname'] = name
                 vm['spec']['template']['spec']['subdomain'] = domain
@@ -300,13 +293,12 @@ class Kubevirt(Kubecommon):
                                                plan=plan, compact=True, image=image)
                 vm['spec']['template']['metadata']['annotations'] = {'kubevirt.io/ignitiondata': ignitiondata}
             else:
-                common.cloudinit(name=name, keys=keys, cmds=cmds, nets=nets, gateway=gateway, dns=dns, domain=domain,
-                                 reserveip=reserveip, files=files, enableroot=enableroot, overrides=overrides,
-                                 iso=False, storemetadata=storemetadata)
-                cloudinitdata = open('/tmp/user-data', 'r').read().strip()
+                userdata = common.cloudinit(name=name, keys=keys, cmds=cmds, nets=nets, gateway=gateway, dns=dns,
+                                            domain=domain, reserveip=reserveip, files=files, enableroot=enableroot,
+                                            overrides=overrides, storemetadata=storemetadata)[0]
                 cloudinitdisk = {'cdrom': {'bus': 'sata'}, 'name': 'cloudinitdisk'}
                 vm['spec']['template']['spec']['domain']['devices']['disks'].append(cloudinitdisk)
-                cloudinitvolume = {'cloudInitNoCloud': {'userData': cloudinitdata}, 'name': 'cloudinitdisk'}
+                cloudinitvolume = {'cloudInitNoCloud': {'userData': userdata}, 'name': 'cloudinitdisk'}
                 vm['spec']['template']['spec']['volumes'].append(cloudinitvolume)
         if self.debug:
             common.pretty_print(vm)
@@ -707,10 +699,13 @@ class Kubevirt(Kubecommon):
         namespace = self.namespace
         try:
             vm = crds.get_namespaced_custom_object(DOMAIN, VERSION, namespace, 'virtualmachines', name)
+        except:
+            return {'result': 'failure', 'reason': "VM %s not found" % name}
+        try:
             crds.delete_namespaced_custom_object(DOMAIN, VERSION, namespace, 'virtualmachines', name,
                                                  client.V1DeleteOptions())
         except:
-            return {'result': 'failure', 'reason': "VM %s not found" % name}
+            crds.delete_namespaced_custom_object(DOMAIN, VERSION, namespace, 'virtualmachines', name)
         pvcvolumes = [v['persistentVolumeClaim']['claimName'] for v in vm['spec']['template']['spec']['volumes'] if
                       'persistentVolumeClaim' in v]
         pvcs = [pvc for pvc in core.list_namespaced_persistent_volume_claim(namespace).items
@@ -892,35 +887,6 @@ class Kubevirt(Kubecommon):
         print("not implemented")
         return
 
-    def ssh(self, name, user=None, local=None, remote=None, tunnel=False, tunnelhost=None, tunnelport=22,
-            tunneluser='root', insecure=False, cmd=None, X=False, Y=False, D=None):
-        u, ip = common._ssh_credentials(self, name)
-        vmport = None
-        if user is None:
-            user = u
-        elif not tunnel:
-            nodeport = self._node_port(name, self.namespace)
-            if nodeport is not None:
-                ip = self.host
-                vmport = nodeport
-        sshcommand = common.ssh(name, ip=ip, user=user, local=local, remote=remote, tunnel=tunnel,
-                                tunnelhost=tunnelhost, tunnelport=tunnelport, tunneluser=tunneluser, insecure=insecure,
-                                cmd=cmd, X=X, Y=Y, debug=self.debug, D=D, vmport=vmport)
-        return sshcommand
-
-    def scp(self, name, user=None, source=None, destination=None, tunnel=False, tunnelhost=None, tunnelport=22,
-            tunneluser='root', download=False, recursive=False,
-            insecure=False):
-        u, ip = common._ssh_credentials(self, name)
-        if ip is None:
-            return None
-        if user is None:
-            user = u
-        scpcommand = common.scp(name, ip=ip, user=user, source=source, destination=destination, recursive=recursive,
-                                tunnel=tunnel, tunnelhost=tunnelhost, tunnelport=tunnelport, tunneluser=tunneluser,
-                                debug=self.debug, download=download, insecure=insecure)
-        return scpcommand
-
     def create_pool(self, name, poolpath, pooltype='dir', user='qemu', thinpool=None):
         print("not implemented")
         return
@@ -1059,7 +1025,12 @@ class Kubevirt(Kubecommon):
         namespace = self.namespace
         apiversion = "%s/%s" % (MULTUSDOMAIN, MULTUSVERSION)
         vlanconfig = '"vlan": %s' % overrides['vlan'] if 'vlan' in overrides is not None else ''
-        config = '{ "cniVersion": "0.3.1", "type": "ovs", "bridge": "%s" %s}' % (name, vlanconfig)
+        if 'type' in overrides:
+            _type = overrides['type']
+        else:
+            common.pprint("Using default type bridge for network", color='blue')
+            _type = 'bridge'
+        config = '{ "cniVersion": "0.3.1", "type": "%s", "bridge": "%s" %s}' % (_type, name, vlanconfig)
         if cidr is not None and dhcp:
             ipam = '"ipam": { "type": "host-local", "subnet": "%s" }' % cidr
             details = '"isDefaultGateway": true, "forceAddress": false, "ipMasq": true, "hairpinMode": true, %s' % ipam
@@ -1075,8 +1046,7 @@ class Kubevirt(Kubecommon):
         namespace = self.namespace
         try:
             crds.delete_namespaced_custom_object(MULTUSDOMAIN, MULTUSVERSION, namespace,
-                                                 'network-attachment-definitions', name,
-                                                 client.V1DeleteOptions())
+                                                 'network-attachment-definitions', name)
         except:
             return {'result': 'failure', 'reason': "network %s not found" % name}
         return {'result': 'success'}
@@ -1093,9 +1063,9 @@ class Kubevirt(Kubecommon):
             # nodeip = node.status.addresses[0].address
             cidr = node.spec.pod_cidr
         networks = {'default': {'cidr': cidr, 'dhcp': True, 'type': 'bridge', 'mode': 'N/A'}}
-        if self.multus:
-            crds = self.crds
-            namespace = self.namespace
+        crds = self.crds
+        namespace = self.namespace
+        try:
             nafs = crds.list_namespaced_custom_object(MULTUSDOMAIN, MULTUSVERSION, namespace,
                                                       'network-attachment-definitions')["items"]
             for naf in nafs:
@@ -1110,7 +1080,9 @@ class Kubevirt(Kubecommon):
                     dhcp = True
                     cidr = config['ipam'].get('subnet', bridge)
                 networks[name] = {'cidr': cidr, 'dhcp': dhcp, 'type': _type, 'mode': vlan}
-            return networks
+        except:
+            pass
+        return networks
 
     def list_subnets(self):
         print("not implemented")

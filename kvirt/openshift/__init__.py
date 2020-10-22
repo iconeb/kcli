@@ -7,14 +7,15 @@ import json
 import os
 import sys
 from kvirt.common import info, pprint, gen_mac, get_oc, get_values, pwd_path, insecure_fetch, fetch
-from kvirt.common import get_commit_rhcos, get_latest_fcos
+from kvirt.common import get_commit_rhcos, get_latest_fcos, kube_create_app, patch_ceo
+from kvirt.common import ssh, scp, _ssh_credentials, word2number
 from kvirt.openshift.calico import calicoassets
-from random import randint
 import re
 from shutil import copy2, rmtree
 from subprocess import call
 from time import sleep
 from urllib.request import urlopen
+import yaml
 
 
 virtplatforms = ['kvm', 'kubevirt', 'ovirt', 'openstack', 'vsphere', 'packet']
@@ -56,7 +57,7 @@ def get_downstream_installer(nightly=False, macosx=False, tag=None):
     repo = 'ocp-dev-preview' if nightly else 'ocp'
     if tag is None:
         repo += '/latest'
-    elif tag.count('.') == 1:
+    elif str(tag).count('.') == 1:
         repo += '/latest-%s' % tag
     else:
         repo += '/%s' % tag
@@ -71,12 +72,13 @@ def get_downstream_installer(nightly=False, macosx=False, tag=None):
             break
     if version is None:
         pprint("Coudldn't find version", color='red')
-        os._exit(1)
+        return 1
     cmd = "curl -s https://mirror.openshift.com/pub/openshift-v4/clients/%s/" % repo
     cmd += "openshift-install-%s-%s.tar.gz " % (INSTALLSYSTEM, version)
     cmd += "| tar zxf - openshift-install"
     cmd += "; chmod 700 openshift-install"
-    call(cmd, shell=True)
+    # pprint("Running: %s" % cmd, color='blue')
+    return call(cmd, shell=True)
 
 
 def get_ci_installer(pull_secret, tag=None, macosx=False, upstream=False):
@@ -100,7 +102,8 @@ def get_ci_installer(pull_secret, tag=None, macosx=False, upstream=False):
     else:
         cmd = "oc adm release extract --registry-config %s --command=openshift-install --to . %s" % (pull_secret, tag)
     cmd += "; chmod 700 openshift-install"
-    call(cmd, shell=True)
+    # pprint("Running: %s" % cmd, color='blue')
+    return call(cmd, shell=True)
 
 
 def get_upstream_installer(macosx=False, tag=None):
@@ -114,7 +117,8 @@ def get_upstream_installer(macosx=False, tag=None):
     cmd += "%s/openshift-install-%s-%s.tar.gz" % (version, INSTALLSYSTEM, version)
     cmd += "| tar zxf - openshift-install"
     cmd += "; chmod 700 openshift-install"
-    call(cmd, shell=True)
+    # pprint("Running: %s" % cmd, color='blue')
+    return call(cmd, shell=True)
 
 
 def gather_dhcp(data, platform):
@@ -164,36 +168,70 @@ def gather_dhcp(data, platform):
 
 
 def scale(config, plandir, cluster, overrides):
+    plan = cluster if cluster is not None else 'testk'
     client = config.client
     platform = config.type
     k = config.k
+    data = {}
     pprint("Scaling on client %s" % client, color='blue')
     cluster = overrides.get('cluster', 'testk')
+    clusterdir = os.path.expanduser("~/.kcli/clusters/%s" % cluster)
+    if not os.path.exists(clusterdir):
+        pprint("Cluster directory %s not found..." % clusterdir, color='red')
+        sys.exit(1)
+    if os.path.exists("%s/kcli_parameters.yml" % clusterdir):
+        with open("%s/kcli_parameters.yml" % clusterdir, 'r') as install:
+            installparam = yaml.safe_load(install)
+            data.update(installparam)
+            plan = installparam.get('plan', plan)
+    data.update(overrides)
+    api_ip = data.get('api_ip')
+    if platform in virtplatforms:
+        if api_ip is None:
+            network = data.get('network')
+            if network == 'default' and platform == 'kvm':
+                pprint("Using 192.168.122.253 as api_ip", color='yellow')
+                data['api_ip'] = "192.168.122.253"
+            else:
+                pprint("You need to define api_ip in your parameters file", color='red')
+                os._exit(1)
+        if data.get('virtual_router_id') is None:
+            data['virtual_router_id'] = word2number(cluster)
+        pprint("Using keepalived virtual_router_id %s" % data['virtual_router_id'], color='blue')
     if platform == 'packet':
-        network = overrides.get('network')
+        network = data.get('network')
         if network is None:
             pprint("You need to indicate a specific vlan network", color='red')
             os._exit(1)
-    image = k.info("%s-master-0" % cluster).get('image')
+    image = overrides.get('image')
     if image is None:
-        pprint("Missing image...", color='red')
-        sys.exit(1)
-    else:
-        pprint("Using image %s" % image, color='blue')
-    overrides['image'] = image
-    if platform in virtplatforms:
-        result = config.plan(cluster, inputfile='%s/workers.yml' % plandir, overrides=overrides)
-    elif platform in cloudplatforms:
-        result = config.plan(cluster, inputfile='%s/cloud_workers.yml' % plandir, overrides=overrides)
-    if result['result'] != 'success':
-        os._exit(1)
-    elif platform == 'packet' and 'newvms' in result and result['newvms']:
-        for node in result['newvms']:
-            k.add_nic(node, network)
+        cluster_image = k.info("%s-master-0" % cluster).get('image')
+        if cluster_image is None:
+            pprint("Missing image...", color='red')
+            sys.exit(1)
+        else:
+            pprint("Using image %s" % cluster_image, color='blue')
+            image = cluster_image
+    data['image'] = image
+    for role in ['masters', 'workers']:
+        overrides = data.copy()
+        if overrides.get(role, 0) == 0:
+            continue
+        if platform in virtplatforms:
+            os.chdir(os.path.expanduser("~/.kcli"))
+            result = config.plan(plan, inputfile='%s/%s.yml' % (plandir, role), overrides=overrides)
+        elif platform in cloudplatforms:
+            result = config.plan(plan, inputfile='%s/cloud_%s.yml' % (plandir, role), overrides=overrides)
+        if result['result'] != 'success':
+            os._exit(1)
+        elif platform == 'packet' and 'newvms' in result and result['newvms']:
+            for node in result['newvms']:
+                k.add_nic(node, network)
 
 
 def create(config, plandir, cluster, overrides):
     k = config.k
+    bootstrap_helper_ip = None
     client = config.client
     platform = config.type
     pprint("Deploying on client %s" % client, color='blue')
@@ -204,18 +242,26 @@ def create(config, plandir, cluster, overrides):
             'workers': 0,
             'tag': DEFAULT_TAG,
             'ipv6': False,
-            'pub_key': '%s/.ssh/id_rsa.pub' % os.environ['HOME'],
+            'pub_key': os.path.expanduser('~/.ssh/id_rsa.pub'),
             'pull_secret': 'openshift_pull.json',
             'version': 'nightly',
             'macosx': False,
             'upstream': False,
             'baremetal': False,
             'fips': False,
+            'apps': [],
             'minimal': False}
     data.update(overrides)
+    data['cluster'] = overrides.get('cluster', cluster if cluster is not None else 'testk')
+    plan = cluster if cluster is not None else data['cluster']
     overrides['kubetype'] = 'openshift'
-    data['cluster'] = overrides['cluster'] if 'cluster' in overrides else cluster
+    apps = overrides.get('apps', [])
+    if ('localstorage' in apps or 'ocs' in apps) and 'extra_disks' not in overrides\
+            and 'extra_master_disks' not in overrides and 'extra_worker_disks' not in overrides:
+        pprint("Storage apps require extra disks to be set", color='yellow')
+    data['cluster'] = overrides.get('cluster', cluster)
     overrides['kube'] = data['cluster']
+    installparam = overrides.copy()
     masters = data.get('masters', 1)
     if masters == 0:
         pprint("Invalid number of masters", color='red')
@@ -255,8 +301,6 @@ def create(config, plandir, cluster, overrides):
     if ingress_ip is None:
         ingress_ip = api_ip
     public_api_ip = data.get('public_api_ip')
-    bootstrap_api_ip = data.get('bootstrap_api_ip')
-    domain = data.get('domain')
     network = data.get('network')
     if platform == 'packet':
         if network == 'default':
@@ -290,14 +334,14 @@ def create(config, plandir, cluster, overrides):
         pprint("Missing pull secret file %s" % pull_secret, color='red')
         sys.exit(1)
     if not os.path.exists(pub_key):
-        if os.path.exists('/%s/.kcli/id_rsa.pub' % os.environ['HOME']):
-            pub_key = '%s/.kcli/id_rsa.pub' % os.environ['HOME']
+        if os.path.exists(os.path.expanduser('~/.kcli/id_rsa.pub')):
+            pub_key = os.path.expanduser('~/.kcli/id_rsa.pub')
         else:
             pprint("Missing public key file %s" % pub_key, color='red')
             sys.exit(1)
-    clusterdir = pwd_path("clusters/%s" % cluster)
+    clusterdir = os.path.expanduser("~/.kcli/clusters/%s" % cluster)
     if os.path.exists(clusterdir):
-        if [v for v in config.k.list() if v['plan'] == cluster]:
+        if [v for v in config.k.list() if v.get('plan', 'kvirt') == cluster]:
             pprint("Please remove existing directory %s first..." % clusterdir, color='red')
             sys.exit(1)
         else:
@@ -305,7 +349,7 @@ def create(config, plandir, cluster, overrides):
             rmtree(clusterdir)
     os.environ['KUBECONFIG'] = "%s/auth/kubeconfig" % clusterdir
     if find_executable('oc') is None:
-        get_oc(macosx)
+        get_oc(macosx=macosx)
     if version == 'ci':
         if '/' not in str(tag):
             basetag = 'ocp' if not upstream else 'origin'
@@ -319,13 +363,16 @@ def create(config, plandir, cluster, overrides):
         pprint("Setting OPENSHIFT_INSTALL_RELEASE_IMAGE_OVERRIDE to %s" % tag, color='blue')
     if find_executable('openshift-install') is None:
         if version == 'ci':
-            get_ci_installer(pull_secret, tag=tag, upstream=upstream)
+            run = get_ci_installer(pull_secret, tag=tag, upstream=upstream)
         elif version == 'nightly':
-            get_downstream_installer(nightly=True, tag=tag)
+            run = get_downstream_installer(nightly=True, tag=tag)
         elif upstream:
-            get_upstream_installer(tag=tag)
+            run = get_upstream_installer(tag=tag)
         else:
-            get_downstream_installer(tag=tag)
+            run = get_downstream_installer(tag=tag)
+        if run != 0:
+            pprint("Couldn't download openshift-install", color='red')
+            os._exit(run)
         pprint("Move downloaded openshift-install somewhere in your path if you want to reuse it", color='blue')
     INSTALLER_VERSION = get_installer_version()
     COMMIT_ID = os.popen('openshift-install version').readlines()[1].replace('built from commit', '').strip()
@@ -368,6 +415,9 @@ def create(config, plandir, cluster, overrides):
     overrides['cluster'] = cluster
     if not os.path.exists(clusterdir):
         os.makedirs(clusterdir)
+        with open("%s/kcli_parameters.yml" % clusterdir, 'w') as p:
+            installparam['plan'] = plan
+            yaml.safe_dump(installparam, p, default_flow_style=False, encoding='utf-8', allow_unicode=True)
     data['pub_key'] = open(pub_key).read().strip()
     if disconnected_url is not None and disconnected_user is not None and disconnected_password is not None:
         key = "%s:%s" % (disconnected_user, disconnected_password)
@@ -425,17 +475,24 @@ def create(config, plandir, cluster, overrides):
         for asset in calicoassets:
             fetch(asset, manifestsdir)
     call('openshift-install --dir=%s create ignition-configs' % clusterdir, shell=True)
+    if masters == 1:
+        version_match = re.match("4.([0-9]*).*", INSTALLER_VERSION)
+        COS_VERSION = "4%s" % version_match.group(1) if version_match is not None else '45'
+        if upstream or int(COS_VERSION) > 43:
+            patch_ceo("%s/bootstrap.ign" % clusterdir)
     staticdata = gather_dhcp(data, platform)
+    domain = data.get('domain')
     if staticdata:
         pprint("Deploying helper dhcp node" % image, color='green')
         staticdata.update({'network': network, 'dhcp_image': helper_image, 'prefix': cluster,
                           domain: '%s.%s' % (cluster, domain)})
-        result = config.plan(cluster, inputfile='%s/dhcp.yml' % plandir, overrides=staticdata)
+        result = config.plan(plan, inputfile='%s/dhcp.yml' % plandir, overrides=staticdata)
         if result['result'] != 'success':
             os._exit(1)
     if platform in virtplatforms:
-        if 'virtual_router_id' not in data:
-            data['virtual_router_id'] = randint(1, 255)
+        if data.get('virtual_router_id') is None:
+            overrides['virtual_router_id'] = word2number(cluster)
+        pprint("Using keepalived virtual_router_id %s" % overrides['virtual_router_id'], color='blue')
         host_ip = ingress_ip if platform != "openstack" else public_api_ip
         pprint("Using %s for api vip...." % api_ip, color='blue')
         ignore_hosts = data.get('ignore_hosts', False)
@@ -491,39 +548,53 @@ def create(config, plandir, cluster, overrides):
                 iptype = 'ip'
                 if platform == 'openstack':
                     helper_overrides['flavor'] = "m1.medium"
-                    iptype = "privateip"
+                    # iptype = "privateip"
             helper_overrides['nets'] = [network]
             helper_overrides['plan'] = cluster
             bootstrap_helper_name = "%s-bootstrap-helper" % cluster
             config.create_vm("%s-bootstrap-helper" % cluster, helper_image, overrides=helper_overrides)
-            while bootstrap_api_ip is None:
-                bootstrap_api_ip = k.info(bootstrap_helper_name).get(iptype)
+            while bootstrap_helper_ip is None:
+                helper_info = k.info(bootstrap_helper_name)
+                bootstrap_helper_ip = helper_info.get(iptype)
+                if platform == 'openstack' and helper_info.get('privateip') == helper_info.get('ip'):
+                    bootstrap_helper_ip = None
                 pprint("Waiting 5s for bootstrap helper node to get an ip...", color='blue')
                 sleep(5)
             cmd = "iptables -F ; yum -y install httpd"
+            cmd += "; setenforce 0"
             if platform == 'packet':
                 cmd += "; sed 's/apache/root/' /etc/httpd/conf/httpd.conf"
                 status = 'provisioning'
-                config.k.tunnelhost = bootstrap_api_ip
+                config.k.tunnelhost = bootstrap_helper_ip
                 while status != 'active':
                     status = k.info(bootstrap_helper_name).get('status')
                     pprint("Waiting 5s for bootstrap helper node to be fully provisioned...", color='blue')
                     sleep(5)
             sleep(5)
             cmd += "; systemctl start httpd"
-            sshcmd = k.ssh(bootstrap_helper_name, user='root', tunnel=config.tunnel,
-                           tunnelhost=config.tunnelhost, tunnelport=config.tunnelport, tunneluser=config.tunneluser,
-                           insecure=True, cmd=cmd)
+            sshcmd = ssh(bootstrap_helper_name, ip=bootstrap_helper_ip, user='root', tunnel=config.tunnel,
+                         tunnelhost=config.tunnelhost, tunnelport=config.tunnelport,
+                         tunneluser=config.tunneluser, insecure=True, cmd=cmd)
             os.system(sshcmd)
             source, destination = "%s/bootstrap.ign" % clusterdir, "/var/www/html/bootstrap"
-            scpcmd = k.scp(bootstrap_helper_name, user='root', source=source, destination=destination,
-                           tunnel=config.tunnel, tunnelhost=config.tunnelhost, tunnelport=config.tunnelport,
-                           tunneluser=config.tunneluser, download=False, insecure=True)
+            scpcmd = scp(bootstrap_helper_name, ip=bootstrap_helper_ip, user='root', source=source,
+                         destination=destination, tunnel=config.tunnel, tunnelhost=config.tunnelhost,
+                         tunnelport=config.tunnelport, tunneluser=config.tunneluser, download=False, insecure=True)
             os.system(scpcmd)
+            cmd = "chown apache.apache /var/www/html/bootstrap"
+            sshcmd = ssh(bootstrap_helper_name, ip=bootstrap_helper_ip, user='root', tunnel=config.tunnel,
+                         tunnelhost=config.tunnelhost, tunnelport=config.tunnelport,
+                         tunneluser=config.tunneluser, insecure=True, cmd=cmd)
+            os.system(sshcmd)
             sedcmd = 'sed "s@https://api-int.%s.%s:22623/config/master@http://%s/bootstrap@" ' % (cluster, domain,
-                                                                                                  bootstrap_api_ip)
+                                                                                                  bootstrap_helper_ip)
             sedcmd += '%s/master.ign' % clusterdir
             sedcmd += ' > %s/bootstrap.ign' % clusterdir
+            call(sedcmd, shell=True)
+            sedcmd = 'sed "s@https://api-int.%s.%s:22623/config/master@http://%s/worker@" ' % (cluster, domain,
+                                                                                               bootstrap_helper_ip)
+            sedcmd += '%s/master.ign' % clusterdir
+            sedcmd += ' > %s/worker.ign' % clusterdir
             call(sedcmd, shell=True)
         if baremetal:
             new_api_ip = api_ip if not ipv6 else "[%s]" % api_ip
@@ -546,44 +617,45 @@ def create(config, plandir, cluster, overrides):
             pprint("Waiting 5s for bootstrap helper node to be running...", color='blue')
             sleep(5)
         sleep(5)
+        bootstrap_helper_ip = _ssh_credentials(k, bootstrap_helper_name)[1]
         cmd = "iptables -F ; yum -y install httpd ; systemctl start httpd"
-        sshcmd = k.ssh(bootstrap_helper_name, user='root', tunnel=config.tunnel,
-                       tunnelhost=config.tunnelhost, tunnelport=config.tunnelport, tunneluser=config.tunneluser,
-                       insecure=True, cmd=cmd)
+        sshcmd = ssh(bootstrap_helper_name, ip=bootstrap_helper_ip, user='root', tunnel=config.tunnel,
+                     tunnelhost=config.tunnelhost, tunnelport=config.tunnelport, tunneluser=config.tunneluser,
+                     insecure=True, cmd=cmd)
         os.system(sshcmd)
         source, destination = "%s/bootstrap.ign" % clusterdir, "/var/www/html/bootstrap"
-        scpcmd = k.scp(bootstrap_helper_name, user='root', source=source, destination=destination,
-                       tunnel=config.tunnel, tunnelhost=config.tunnelhost, tunnelport=config.tunnelport,
-                       tunneluser=config.tunneluser, download=False, insecure=True)
+        scpcmd = scp(bootstrap_helper_name, ip=bootstrap_helper_ip, user='root', source=source, destination=destination,
+                     tunnel=config.tunnel, tunnelhost=config.tunnelhost, tunnelport=config.tunnelport,
+                     tunneluser=config.tunneluser, download=False, insecure=True)
         os.system(scpcmd)
         sedcmd = 'sed "s@https://api-int.%s.%s:22623/config/master@' % (cluster, domain)
         sedcmd += 'http://%s-bootstrap-helper.%s.%s/bootstrap@ "' % (cluster, domain)
         sedcmd += '%s/master.ign' % clusterdir
         sedcmd += ' > %s/bootstrap.ign' % clusterdir
         call(sedcmd, shell=True)
-    if masters == 1:
-        version_match = re.match("4.([0-9]*).*", INSTALLER_VERSION)
-        COS_VERSION = "4%s" % version_match.group(1) if version_match is not None else '45'
-        if upstream or int(COS_VERSION) > 43:
-            overrides['fix_ceo'] = True
     if platform in virtplatforms:
         if disconnected_deploy:
             disconnected_vm = "%s-disconnecter" % cluster
             cmd = "cat /opt/registry/certs/domain.crt"
             pprint("Deploying disconnected vm %s" % disconnected_vm, color='blue')
-            result = config.plan(cluster, inputfile='%s/disconnected' % plandir, overrides=overrides, wait=True)
+            result = config.plan(plan, inputfile='%s/disconnected' % plandir, overrides=overrides, wait=True)
             if result['result'] != 'success':
                 os._exit(1)
-            cacmd = k.ssh(disconnected_vm, user='root', tunnel=config.tunnel,
-                          tunnelhost=config.tunnelhost, tunnelport=config.tunnelport, tunneluser=config.tunneluser,
-                          insecure=True, cmd=cmd)
+            disconnected_ip = _ssh_credentials(k, disconnected_vm)[1]
+            cacmd = ssh(disconnected_vm, ip=disconnected_ip, user='root', tunnel=config.tunnel,
+                        tunnelhost=config.tunnelhost, tunnelport=config.tunnelport, tunneluser=config.tunneluser,
+                        insecure=True, cmd=cmd)
             disconnected_ca = os.popen(cacmd).read()
             if 'ca' in overrides:
                 overrides['ca'] += disconnected_ca
             else:
                 overrides['ca'] = disconnected_ca
+        pprint("Deploying bootstrap", color='blue')
+        result = config.plan(plan, inputfile='%s/bootstrap.yml' % plandir, overrides=overrides)
+        if result['result'] != 'success':
+            os._exit(1)
         pprint("Deploying masters", color='blue')
-        result = config.plan(cluster, inputfile='%s/masters.yml' % plandir, overrides=overrides)
+        result = config.plan(plan, inputfile='%s/masters.yml' % plandir, overrides=overrides)
         if result['result'] != 'success':
             os._exit(1)
         if platform == 'packet':
@@ -605,31 +677,51 @@ def create(config, plandir, cluster, overrides):
         if platform in ['kubevirt', 'openstack', 'vsphere', 'packet']:
             todelete.append("%s-bootstrap-helper" % cluster)
     else:
-        result = config.plan(cluster, inputfile='%s/cloud_masters.yml' % plandir, overrides=overrides)
+        pprint("Deploying bootstrap", color='blue')
+        result = config.plan(plan, inputfile='%s/cloud_bootstrap.yml' % plandir, overrides=overrides)
+        if result['result'] != 'success':
+            os._exit(1)
+        pprint("Deploying masters", color='blue')
+        result = config.plan(plan, inputfile='%s/cloud_masters.yml' % plandir, overrides=overrides)
         if result['result'] != 'success':
             os._exit(1)
         call('openshift-install --dir=%s wait-for bootstrap-complete || exit 1' % clusterdir, shell=True)
         todelete = ["%s-bootstrap" % cluster, "%s-bootstrap-helper" % cluster]
     if platform in virtplatforms:
-        ignitionworkerfile = "%s/worker.ign" % clusterdir
-        os.remove(ignitionworkerfile)
-        while not os.path.exists(ignitionworkerfile) or os.stat(ignitionworkerfile).st_size == 0:
-            try:
-                with open(ignitionworkerfile, 'w') as w:
-                    workerdata = insecure_fetch("https://api.%s.%s:22623/config/worker" % (cluster, domain),
-                                                headers=[curl_header])
-                    w.write(workerdata)
-            except:
-                pprint("Waiting 5s before retrieving workers ignition data", color='blue')
-                sleep(5)
+        for role in ['worker', 'master']:
+            if bootstrap_helper_ip is not None:
+                ignitionrolefile = "%s/%s" % (clusterdir, role)
+            else:
+                ignitionrolefile = "%s/%s.ign" % (clusterdir, role)
+                os.remove(ignitionrolefile)
+            while not os.path.exists(ignitionrolefile) or os.stat(ignitionrolefile).st_size == 0:
+                try:
+                    with open(ignitionrolefile, 'w') as w:
+                        roledata = insecure_fetch("https://api.%s.%s:22623/config/%s" % (cluster, domain, role),
+                                                  headers=[curl_header])
+                        w.write(roledata)
+                except:
+                    pprint("Waiting 5s before retrieving %s ignition data" % role, color='blue')
+                    sleep(5)
+            if bootstrap_helper_ip is not None:
+                source, destination = "%s/%s" % (clusterdir, role), "/var/www/html/%s" % role
+                scpcmd = scp(bootstrap_helper_name, ip=bootstrap_helper_ip, user='root', source=source,
+                             destination=destination, tunnel=config.tunnel, tunnelhost=config.tunnelhost,
+                             tunnelport=config.tunnelport, tunneluser=config.tunneluser, download=False, insecure=True)
+                os.system(scpcmd)
+                cmd = "chown apache.apache /var/www/html/%s" % role
+                sshcmd = ssh(bootstrap_helper_name, ip=bootstrap_helper_ip, user='root', tunnel=config.tunnel,
+                             tunnelhost=config.tunnelhost, tunnelport=config.tunnelport,
+                             tunneluser=config.tunneluser, insecure=True, cmd=cmd)
+                os.system(sshcmd)
         if workers > 0:
             pprint("Deploying workers", color='blue')
             if 'name' in overrides:
                 del overrides['name']
             if platform in virtplatforms:
-                result = config.plan(cluster, inputfile='%s/workers.yml' % plandir, overrides=overrides)
+                result = config.plan(plan, inputfile='%s/workers.yml' % plandir, overrides=overrides)
             elif platform in cloudplatforms:
-                result = config.plan(cluster, inputfile='%s/cloud_workers.yml' % plandir, overrides=overrides)
+                result = config.plan(plan, inputfile='%s/cloud_workers.yml' % plandir, overrides=overrides)
             if result['result'] != 'success':
                 os._exit(1)
             if platform == 'packet':
@@ -639,6 +731,12 @@ def create(config, plandir, cluster, overrides):
     call("oc adm taint nodes -l node-role.kubernetes.io/master node-role.kubernetes.io/master:NoSchedule-", shell=True)
     pprint("Deploying certs autoapprover cronjob", color='blue')
     call("oc create -f %s/autoapprovercron.yml" % clusterdir, shell=True)
+    if masters == 1 and int(COS_VERSION) > 45:
+        pprint("Patching authentication for single master", color='yellow')
+        authcommand = "oc patch authentications.operator.openshift.io "
+        authcommand += "cluster -p='{\"spec\": {\"unsupportedConfigOverrides\": "
+        authcommand += "{\"useUnsupportedUnsafeNonHANonProductionUnstableOAuthServer\": true}}}' --type=merge"
+        call(authcommand, shell=True)
     if not minimal:
         installcommand = 'openshift-install --dir=%s wait-for install-complete' % clusterdir
         installcommand += " || %s" % installcommand
@@ -656,3 +754,13 @@ def create(config, plandir, cluster, overrides):
     for vm in todelete:
         pprint("Deleting %s" % vm)
         k.delete(vm)
+    os.environ['KUBECONFIG'] = "%s/auth/kubeconfig" % clusterdir
+    if apps:
+        overrides['openshift_version'] = INSTALLER_VERSION[0:3]
+        for app in apps:
+            appdir = "%s/apps/%s" % (plandir, app)
+            if not os.path.exists(appdir):
+                pprint("Skipping unsupported app %s" % app, color='yellow')
+            else:
+                pprint("Adding app %s" % app, color='blue')
+                kube_create_app(config, appdir, overrides=overrides)

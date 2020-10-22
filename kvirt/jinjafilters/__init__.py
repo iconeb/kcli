@@ -1,5 +1,7 @@
 from base64 import b64encode
 import os
+from distutils.version import LooseVersion
+import requests
 
 
 def basename(path):
@@ -49,5 +51,46 @@ def certificate(value):
         return "-----BEGIN CERTIFICATE-----\n%s\n-----END CERTIFICATE-----" % value
 
 
+def githubversion(repo, version=None):
+    if version is None or version == 'latest':
+        data = requests.get("https://api.github.com/repos/%s/releases" % repo).json()
+        if 'message' in data and data['message'] == 'Not Found':
+            return ''
+        tags = sorted([x['tag_name'] for x in data], key=LooseVersion, reverse=True)
+        for tag in tags:
+            if 'rc' not in tag and 'alpha' not in tag and 'beta' not in tag:
+                print('\033[0;36mUsing version %s\033[0;0m' % tag)
+                return tag
+        return tags[0]
+
+
+def defaultnodes(replicas, cluster, domain, masters, workers):
+    nodes = []
+    for num in range(workers):
+        if len(nodes) < replicas:
+            nodes.append('%s-worker-%d.%s' % (cluster, num, domain))
+    for num in range(masters):
+        if len(nodes) < replicas:
+            nodes.append('%s-master-%d.%s' % (cluster, num, domain))
+    return nodes
+
+
+def waitcrd(crd, timeout=60):
+    result = """timeout=0
+ready=false
+while [ "$timeout" -lt "%s" ] ; do
+  oc get crd | grep -q %s && ready=true && break;
+  echo "Waiting for CRD %s to be created"
+  sleep 5
+  timeout=$(($timeout + 5))
+done
+if [ "$ready" == "false" ] ; then
+ echo timeout waiting for CRD %s
+ exit 1
+fi """ % (timeout, crd, crd, crd)
+    return result
+
+
 jinjafilters = {'basename': basename, 'dirname': dirname, 'ocpnodes': ocpnodes, 'none': none, 'type': _type,
-                'certificate': certificate, 'base64': base64}
+                'certificate': certificate, 'base64': base64, 'githubversion': githubversion,
+                'defaultnodes': defaultnodes, 'waitcrd': waitcrd}

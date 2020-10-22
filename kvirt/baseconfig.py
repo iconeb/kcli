@@ -11,12 +11,12 @@ from kvirt.defaults import (NETS, POOL, CPUMODEL, NUMCPUS, MEMORY, DISKS,
                             START, AUTOSTART, NESTED, TUNNEL, TUNNELHOST, TUNNELPORT, TUNNELUSER, TUNNELDIR,
                             INSECURE, KEYS, CMDS, DNS, DOMAIN, SCRIPTS, FILES, ISO,
                             NETMASKS, GATEWAY, SHAREDKEY, IMAGE, ENABLEROOT,
-                            PLANVIEW, PRIVATEKEY, TAGS, RHNREGISTER, RHNUSER, RHNPASSWORD, RHNAK, RHNORG, RHNPOOL,
-                            RHNWAIT, FLAVOR, KEEP_NETWORKS, DNSCLIENT, STORE_METADATA, NOTIFY, PUSHBULLETTOKEN,
+                            PRIVATEKEY, TAGS, RHNREGISTER, RHNUSER, RHNPASSWORD, RHNAK, RHNORG, RHNPOOL,
+                            NETWORKWAIT, FLAVOR, KEEP_NETWORKS, DNSCLIENT, STORE_METADATA, NOTIFY, PUSHBULLETTOKEN,
                             NOTIFYSCRIPT, SLACKTOKEN, NOTIFYCMD, NOTIFYMETHODS, SLACKCHANNEL, SHAREDFOLDERS, KERNEL,
                             INITRD, CMDLINE, PLACEMENT, YAMLINVENTORY, CPUHOTPLUG, MEMORYHOTPLUG, CPUFLAGS, CPUPINNING,
                             NUMAMODE, NUMA, PCIDEVICES, VIRTTYPE, MAILSERVER, MAILFROM, MAILTO, TPM, JENKINSMODE, RNG,
-                            ZEROTIER, CACHE)
+                            ZEROTIER_NETS, ZEROTIER_KUBELET, VMPORT, VMUSER, CLIENTRULES, CACHE)
 from kvirt import common
 from kvirt import jinjafilters
 from kvirt import k3s
@@ -136,15 +136,14 @@ class Kbaseconfig:
         defaults['gateway'] = default.get('gateway', GATEWAY)
         defaults['sharedkey'] = default.get('sharedkey', SHAREDKEY)
         defaults['enableroot'] = default.get('enableroot', ENABLEROOT)
-        defaults['planview'] = default.get('planview', PLANVIEW)
         defaults['privatekey'] = default.get('privatekey', PRIVATEKEY)
+        defaults['networkwait'] = default.get('networkwait', NETWORKWAIT)
         defaults['rhnregister'] = default.get('rhnregister', RHNREGISTER)
         defaults['rhnuser'] = default.get('rhnuser', RHNUSER)
         defaults['rhnpassword'] = default.get('rhnpassword', RHNPASSWORD)
         defaults['rhnactivationkey'] = default.get('rhnactivationkey', RHNAK)
         defaults['rhnorg'] = default.get('rhnorg', RHNORG)
         defaults['rhnpool'] = default.get('rhnpool', RHNPOOL)
-        defaults['rhnwait'] = default.get('rhnwait', RHNWAIT)
         defaults['tags'] = default.get('tags', TAGS)
         defaults['flavor'] = default.get('flavor', FLAVOR)
         defaults['keep_networks'] = default.get('keep_networks', KEEP_NETWORKS)
@@ -171,9 +170,13 @@ class Kbaseconfig:
         defaults['virttype'] = default.get('virttype', VIRTTYPE)
         defaults['tpm'] = default.get('tpm', TPM)
         defaults['rng'] = default.get('rng', RNG)
-        defaults['zerotier'] = default.get('zerotier', ZEROTIER)
-        defaults['cache'] = default.get('cache', CACHE)
+        defaults['zerotier_nets'] = default.get('zerotier_nets', ZEROTIER_NETS)
+        defaults['zerotier_kubelet'] = default.get('zerotier_kubelet', ZEROTIER_KUBELET)
         defaults['jenkinsmode'] = default.get('jenkinsmode', JENKINSMODE)
+        defaults['vmuser'] = default.get('vmuser', VMUSER)
+        defaults['vmport'] = default.get('vmport', VMPORT)
+        defaults['clientrules'] = default.get('clientrules', CLIENTRULES)
+        defaults['cache'] = default.get('cache', CACHE)
         currentplanfile = "%s/.kcli/plan" % os.environ.get('HOME')
         if os.path.exists(currentplanfile):
             self.currentplan = open(currentplanfile).read().strip()
@@ -237,10 +240,12 @@ class Kbaseconfig:
         self.image = options.get('image', self.default['image'])
         self.tunnel = bool(options.get('tunnel', self.default['tunnel']))
         self.tunnelhost = options.get('tunnelhost', self.default['tunnelhost'])
-        if self.tunnelhost is None and self.type == 'kvm':
-            self.tunnelhost = self.host
         self.tunnelport = options.get('tunnelport', self.default['tunnelport'])
         self.tunneluser = options.get('tunneluser', self.default['tunneluser'])
+        if self.tunnelhost is None and self.type == 'kvm' and self.host != '127.0.0.1':
+            self.tunnelhost = self.host
+            self.tunnelport = self.port
+            self.tunneluser = self.user
         self.tunneldir = options.get('tunneldir', self.default['tunneldir'])
         self.insecure = bool(options.get('insecure', self.default['insecure']))
         self.nets = options.get('nets', self.default['nets'])
@@ -252,8 +257,8 @@ class Kbaseconfig:
         self.pcidevices = options.get('pcidevices', PCIDEVICES)
         self.tpm = options.get('tpm', self.default['tpm'])
         self.rng = options.get('rng', self.default['rng'])
-        self.zerotier = options.get('zerotier', self.default['zerotier'])
-        self.cache = options.get('cache', self.default['cache'])
+        self.zerotier_nets = options.get('zerotier_nets', self.default['zerotier_nets'])
+        self.zerotier_kubelet = options.get('zerotier_kubelet', self.default['zerotier_kubelet'])
         self.jenkinsmode = options.get('jenkinsmode', self.default['jenkinsmode'])
         self.numcpus = options.get('numcpus', self.default['numcpus'])
         self.memory = options.get('memory', self.default['memory'])
@@ -279,11 +284,11 @@ class Kbaseconfig:
         self.gateway = options.get('gateway', self.default['gateway'])
         self.sharedkey = options.get('sharedkey', self.default['sharedkey'])
         self.enableroot = options.get('enableroot', self.default['enableroot'])
-        self.planview = options.get('planview', self.default['planview'])
         self.dns = options.get('dns', self.default['dns'])
         self.domain = options.get('domain', self.default['domain'])
         self.scripts = options.get('scripts', self.default['scripts'])
         self.files = options.get('files', self.default['files'])
+        self.networkwait = options.get('networkwait', self.default['networkwait'])
         self.privatekey = options.get('privatekey', self.default['privatekey'])
         self.rhnregister = options.get('rhnregister', self.default['rhnregister'])
         self.rhnuser = options.get('rhnuser', self.default['rhnuser'])
@@ -291,7 +296,6 @@ class Kbaseconfig:
         self.rhnak = options.get('rhnactivationkey', self.default['rhnactivationkey'])
         self.rhnorg = options.get('rhnorg', self.default['rhnorg'])
         self.rhnpool = options.get('rhnpool', self.default['rhnpool'])
-        self.rhnwait = options.get('rhnwait', self.default['rhnwait'])
         self.tags = options.get('tags', self.default['tags'])
         self.flavor = options.get('flavor', self.default['flavor'])
         self.dnsclient = options.get('dnsclient', self.default['dnsclient'])
@@ -317,6 +321,10 @@ class Kbaseconfig:
         self.memoryhotplug = options.get('memoryhotplug', self.default['memoryhotplug'])
         self.virttype = options.get('virttype', self.default['virttype'])
         self.containerclient = containerclient
+        self.vmuser = options.get('vmuser', self.default['vmuser'])
+        self.vmport = options.get('vmport', self.default['vmport'])
+        self.clientrules = options.get('clientrules', self.default['clientrules'])
+        self.cache = options.get('cache', self.default['cache'])
         self.overrides = {}
 
     def switch_host(self, client):
@@ -973,3 +981,75 @@ class Kbaseconfig:
         plandir = os.path.dirname(openshift.create.__code__.co_filename)
         inputfile = '%s/masters.yml' % plandir
         return self.info_plan(inputfile, quiet=quiet, web=web)
+
+    def list_apps_generic(self, quiet=True):
+        plandir = os.path.dirname(kubeadm.create.__code__.co_filename)
+        appdir = plandir + '/apps'
+        return sorted([x for x in os.listdir(appdir) if os.path.isdir("%s/%s" % (appdir, x)) and x != '__pycache__'])
+
+    def list_apps_openshift(self, quiet=True):
+        plandir = os.path.dirname(openshift.create.__code__.co_filename)
+        appdir = plandir + '/apps'
+        return sorted([x for x in os.listdir(appdir) if os.path.isdir("%s/%s" % (appdir, x)) and x != '__pycache__'])
+
+    def create_app_generic(self, app, overrides={}):
+        plandir = os.path.dirname(kubeadm.create.__code__.co_filename)
+        appdir = "%s/apps/%s" % (plandir, app)
+        common.kube_create_app(self, appdir, overrides=overrides)
+
+    def delete_app_generic(self, app, overrides={}):
+        plandir = os.path.dirname(kubeadm.create.__code__.co_filename)
+        appdir = "%s/apps/%s" % (plandir, app)
+        common.kube_delete_app(self, appdir, overrides=overrides)
+
+    def info_app_generic(self, app):
+        plandir = os.path.dirname(kubeadm.create.__code__.co_filename)
+        appdir = "%s/apps/%s" % (plandir, app)
+        default_parameter_file = "%s/kcli_default.yml" % appdir
+        if not os.path.exists(appdir):
+            common.pprint("App %s not supported" % app, color='yellow')
+        elif not os.path.exists(default_parameter_file):
+            print("%s_version: latest" % app)
+        else:
+            with open(default_parameter_file, 'r') as f:
+                print(f.read().strip())
+
+    def create_app_openshift(self, app, overrides={}):
+        plandir = os.path.dirname(openshift.create.__code__.co_filename)
+        appdir = "%s/apps/%s" % (plandir, app)
+        common.kube_create_app(self, appdir, overrides=overrides)
+
+    def delete_app_openshift(self, app, overrides={}):
+        plandir = os.path.dirname(openshift.create.__code__.co_filename)
+        appdir = "%s/apps/%s" % (plandir, app)
+        common.kube_delete_app(self, appdir, overrides=overrides)
+
+    def info_app_openshift(self, app):
+        plandir = os.path.dirname(openshift.create.__code__.co_filename)
+        appdir = "%s/apps/%s" % (plandir, app)
+        default_parameter_file = "%s/kcli_default.yml" % appdir
+        if not os.path.exists(appdir):
+            common.pprint("App %s not supported" % app, color='yellow')
+        elif not os.path.exists(default_parameter_file):
+            return
+        else:
+            with open(default_parameter_file, 'r') as f:
+                print(f.read().strip())
+
+    def download_openshift_installer(self, overrides={}):
+        pull_secret = overrides.get('pull_secret', 'openshift_pull.json')
+        version = overrides.get('version', 'stable')
+        tag = overrides.get('tag', '4.5')
+        upstream = overrides.get('upstream', False)
+        macosx = True if os.path.exists('/Users') else False
+        if version == 'ci':
+            run = openshift.get_ci_installer(pull_secret, tag=tag, macosx=macosx, upstream=upstream)
+        elif version == 'nightly':
+            run = openshift.get_downstream_installer(nightly=True, tag=tag, macosx=macosx)
+        elif upstream:
+            run = openshift.get_upstream_installer(tag=tag, macosx=macosx)
+        else:
+            run = openshift.get_downstream_installer(tag=tag, macosx=macosx)
+        if run != 0:
+            common.pprint("Couldn't download openshift-install", color='red')
+            os._exit(run)

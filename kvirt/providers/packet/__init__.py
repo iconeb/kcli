@@ -7,7 +7,7 @@ Packet provider class
 from packet import Manager
 from packet.baseapi import Error
 from kvirt import common
-from kvirt.defaults import IMAGES
+from kvirt.defaults import IMAGES, METADATA_FIELDS
 import json
 import requests
 import os
@@ -89,9 +89,9 @@ class Kpacket(object):
                reservehost=False, start=True, keys=None, cmds=[], ips=None,
                netmasks=None, gateway=None, nested=True, dns=None, domain=None,
                tunnel=False, files=[], enableroot=True, alias=[], overrides={},
-               tags=[], dnsclient=None, storemetadata=False, sharedfolders=[], kernel=None, initrd=None,
+               tags=[], storemetadata=False, sharedfolders=[], kernel=None, initrd=None,
                cmdline=None, cpuhotplug=False, memoryhotplug=False, numamode=None, numa=[], pcidevices=[], tpm=False,
-               placement=[], autostart=False, rng=False, kube=None, kubetype=None):
+               placement=[], autostart=False, rng=False, metadata={}):
         """
 
         :param name:
@@ -251,10 +251,9 @@ class Kpacket(object):
                 validfacilities = flavors[0].available_in
         features = ['tpm'] if tpm else []
         if cloudinit and userdata is None:
-            common.cloudinit(name=name, keys=keys, cmds=cmds, nets=nets, gateway=gateway, dns=dns, domain=domain,
-                             reserveip=reserveip, files=files, enableroot=enableroot, overrides=overrides,
-                             iso=False, fqdn=True, storemetadata=storemetadata)
-            userdata = open('/tmp/user-data', 'r').read()
+            userdata = common.cloudinit(name=name, keys=keys, cmds=cmds, nets=nets, gateway=gateway, dns=dns,
+                                        domain=domain, reserveip=reserveip, files=files, enableroot=enableroot,
+                                        overrides=overrides, fqdn=True, storemetadata=storemetadata)[0]
         validfacilities = [os.path.basename(e['href']) for e in validfacilities]
         validfacilities = [f.code for f in self.conn.list_facilities() if f.id in validfacilities]
         if not validfacilities:
@@ -276,12 +275,11 @@ class Kpacket(object):
             facility = self.facility
         else:
             facility = validfacilities[0]
-        tags = ['plan_%s' % plan, 'profile_%s' % profile, 'project_%s' % self.project]
+        tags = ['project_%s' % self.project]
         if userdata is not None and 'ignition' in userdata:
             tags.append("kernel_%s" % os.path.basename(kernel))
-        if kube is not None and kubetype is not None:
-            tags.append("kube_%s" % kube)
-            tags.append("kubetype_%s" % kubetype)
+        for entry in [field for field in metadata if field in METADATA_FIELDS]:
+            tags.append("%s_%s" % (entry, metadata[entry]))
         # ip_addresses = [{"address_family": 4, "public": True}, {"address_family": 6, "public": False}]
         data = {'project_id': self.project, 'hostname': name, 'plan': flavor, 'facility': facility,
                 'operating_system': image, 'userdata': userdata, 'features': features, 'tags': tags}
@@ -496,22 +494,7 @@ class Kpacket(object):
                     network = ','.join(vlans)
                 mac = entry['data']['mac']
                 nets.append({'device': dev, 'mac': mac, 'net': network, 'type': networktype})
-        plan, profile = 'kvirt', 'kvirt'
-        kube, kubetype = None, None
         kernel = None
-        tags = device.tags
-        if tags:
-            for tag in tags:
-                if tag.startswith('plan_'):
-                    plan = tag.replace('plan_', '')
-                if tag.startswith('profile_'):
-                    profile = tag.replace('profile_', '')
-                if tag.startswith('kernel_'):
-                    kernel = tag.replace('kernel_', '')
-                if tag.startswith('kube_'):
-                    kube = tag.replace('kube_', '')
-                if tag.startswith('kubetype_'):
-                    kubetype = tag.replace('kubetype_', '')
         source = device.operating_system['slug']
         flavor = device.plan
         flavorname = device.plan['slug']
@@ -541,17 +524,19 @@ class Kpacket(object):
         numcpus = int(flavor['specs']['cpus'][0]['count'])
         memory = int(flavor['specs']['memory']['total'].replace('GB', '')) * 1024
         creationdate = device.created_at
-        yamlinfo = {'name': name, 'instanceid': deviceid, 'status': state, 'ip': ip, 'plan': plan,
-                    'profile': profile, 'nets': nets, 'disks': disks, 'flavor': flavorname, 'cpus': numcpus,
-                    'memory': memory, 'creationdate': creationdate}
-        yamlinfo['image'] = kernel if kernel is not None and source == 'custom_ipxe' else source
+        yamlinfo = {'name': name, 'instanceid': deviceid, 'status': state, 'ip': ip, 'nets': nets, 'disks': disks,
+                    'flavor': flavorname, 'cpus': numcpus, 'memory': memory, 'creationdate': creationdate}
         if ip is not None:
             yamlinfo['ip'] = ip
         yamlinfo['user'] = common.get_user(kernel) if kernel is not None else 'root'
-        if kube is not None:
-            yamlinfo['kube'] = kube
-        if kubetype is not None:
-            yamlinfo['kubetype'] = kubetype
+        if device.tags:
+            for tag in device.tags:
+                if '_' in tag and len(tag.split('_')) == 2:
+                    key, value = tag.split('_')
+                    yamlinfo[key] = value
+                    if key == 'kernel':
+                        kernel = value
+        yamlinfo['image'] = kernel if kernel is not None and source == 'custom_ipxe' else source
         # for entry in device.network_ports:
         #    print(entry)
         return yamlinfo
@@ -822,64 +807,6 @@ class Kpacket(object):
         """
         print("not implemented")
         return
-
-    def ssh(self, name, user=None, local=None, remote=None, tunnel=False, tunnelhost=None, tunnelport=22,
-            tunneluser='root', insecure=False, cmd=None, X=False, Y=False, D=None):
-        """
-
-        :param name:
-        :param user:
-        :param local:
-        :param remote:
-        :param tunnel:
-        :param insecure:
-        :param cmd:
-        :param X:
-        :param Y:
-        :param D:
-        :return:
-        """
-        u, ip = common._ssh_credentials(self, name)
-        if ip is None:
-            return None
-        if user is None:
-            user = u
-        vmport = None
-        if '.' not in ip and ':' not in ip:
-            vmport = ip
-            ip = self.host
-        sshcommand = common.ssh(name, ip=ip, user=user, local=local, remote=remote, tunnel=tunnel,
-                                tunnelhost=tunnelhost, tunnelport=tunnelport, tunneluser=tunneluser, insecure=insecure,
-                                cmd=cmd, X=X, Y=Y, D=D, debug=self.debug, vmport=vmport)
-        return sshcommand
-
-    def scp(self, name, user=None, source=None, destination=None, tunnel=False, tunnelhost=None, tunnelport=22,
-            tunneluser='root', download=False, recursive=False, insecure=False):
-        """
-
-        :param name:
-        :param user:
-        :param source:
-        :param destination:
-        :param tunnel:
-        :param download:
-        :param recursive:
-        :param insecure:
-        :return:
-        """
-        u, ip = common._ssh_credentials(self, name)
-        if ip is None:
-            return None
-        if user is None:
-            user = u
-        vmport = None
-        if '.' not in ip:
-            vmport = ip
-            ip = '127.0.0.1'
-        scpcommand = common.scp(name, ip=ip, user=user, source=source, destination=destination, recursive=recursive,
-                                tunnel=tunnel, tunnelhost=tunnelhost, tunnelport=tunnelport, tunneluser=tunneluser,
-                                debug=self.debug, download=download, vmport=vmport, insecure=insecure)
-        return scpcommand
 
     def create_pool(self, name, poolpath, pooltype='dir', user='qemu', thinpool=None):
         """
