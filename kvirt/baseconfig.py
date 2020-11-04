@@ -36,7 +36,7 @@ class Kbaseconfig:
     """
 
     """
-    def __init__(self, client=None, containerclient=None, debug=False, quiet=False):
+    def __init__(self, client=None, containerclient=None, debug=False, quiet=False, offline=False):
         self.debug = debug
         homedir = os.environ.get('HOME')
         cmdir = "%s/.kcli_cm" % homedir
@@ -56,9 +56,8 @@ class Kbaseconfig:
                     os._exit(1)
         if not os.path.exists(inifile):
             defaultclient = 'local'
-            if os.path.exists('/var/run/libvirt/libvirt-sock'):
-                _type = 'kvm'
-            else:
+            _type = 'kvm'
+            if not os.path.exists('/var/run/libvirt/libvirt-sock') and not offline:
                 common.pprint("No configuration found nor local hypervisor", color='red')
                 os._exit(1)
             self.ini = {'default': {'client': defaultclient}, defaultclient:
@@ -992,10 +991,10 @@ class Kbaseconfig:
         appdir = plandir + '/apps'
         return sorted([x for x in os.listdir(appdir) if os.path.isdir("%s/%s" % (appdir, x)) and x != '__pycache__'])
 
-    def create_app_generic(self, app, overrides={}):
+    def create_app_generic(self, app, overrides={}, outputdir=None):
         plandir = os.path.dirname(kubeadm.create.__code__.co_filename)
         appdir = "%s/apps/%s" % (plandir, app)
-        common.kube_create_app(self, appdir, overrides=overrides)
+        common.kube_create_app(self, appdir, overrides=overrides, outputdir=outputdir)
 
     def delete_app_generic(self, app, overrides={}):
         plandir = os.path.dirname(kubeadm.create.__code__.co_filename)
@@ -1014,10 +1013,10 @@ class Kbaseconfig:
             with open(default_parameter_file, 'r') as f:
                 print(f.read().strip())
 
-    def create_app_openshift(self, app, overrides={}):
+    def create_app_openshift(self, app, overrides={}, outputdir=None):
         plandir = os.path.dirname(openshift.create.__code__.co_filename)
         appdir = "%s/apps/%s" % (plandir, app)
-        common.kube_create_app(self, appdir, overrides=overrides)
+        common.kube_create_app(self, appdir, overrides=overrides, outputdir=outputdir)
 
     def delete_app_openshift(self, app, overrides={}):
         plandir = os.path.dirname(openshift.create.__code__.co_filename)

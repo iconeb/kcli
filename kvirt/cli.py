@@ -792,6 +792,15 @@ def choose_parameter_file(paramfile):
 
 def create_app_generic(args):
     apps = args.apps
+    outputdir = args.outputdir
+    if outputdir is not None:
+        if os.path.exists("/i_am_a_container") and not outputdir.startswith('/'):
+            outputdir = "/workdir/%s" % outputdir
+        if os.path.exists(outputdir) and os.path.isfile(outputdir):
+            common.pprint("Invalid outputdir %s" % outputdir, color='red')
+            os._exit(1)
+        elif not os.path.exists(outputdir):
+            os.mkdir(outputdir)
     paramfile = choose_parameter_file(args.paramfile)
     if find_executable('kubectl') is None:
         common.pprint("You need kubectl to install apps", color='red')
@@ -802,7 +811,7 @@ def create_app_generic(args):
     elif not os.path.isabs(os.environ['KUBECONFIG']):
         os.environ['KUBECONFIG'] = "%s/%s" % (os.getcwd(), os.environ['KUBECONFIG'])
     overrides = common.get_overrides(paramfile=paramfile, param=args.param)
-    baseconfig = Kbaseconfig(client=args.client, debug=args.debug)
+    baseconfig = Kbaseconfig(client=args.client, debug=args.debug, offline=True)
     available_apps = baseconfig.list_apps_generic(quiet=True)
     for app in apps:
         if app not in available_apps:
@@ -810,11 +819,20 @@ def create_app_generic(args):
             continue
         common.pprint("Adding app %s" % app, color='blue')
         overrides['%s_version' % app] = overrides['version'] if 'version' in overrides else 'latest'
-        baseconfig.create_app_generic(app, overrides)
+        baseconfig.create_app_generic(app, overrides, outputdir=outputdir)
 
 
 def create_app_openshift(args):
     apps = args.apps
+    outputdir = args.outputdir
+    if outputdir is not None:
+        if os.path.exists("/i_am_a_container") and not outputdir.startswith('/'):
+            outputdir = "/workdir/%s" % outputdir
+        if os.path.exists(outputdir) and os.path.isfile(outputdir):
+            common.pprint("Invalid outputdir %s" % outputdir, color='red')
+            os._exit(1)
+        elif not os.path.exists(outputdir):
+            os.mkdir(outputdir)
     paramfile = choose_parameter_file(args.paramfile)
     if find_executable('oc') is None:
         common.pprint("You need oc to install apps", color='red')
@@ -827,14 +845,14 @@ def create_app_openshift(args):
     OPENSHIFT_VERSION = os.popen('oc version').readlines()[1].split(" ")[2].strip().replace('v', '')[:3]
     overrides = common.get_overrides(paramfile=paramfile, param=args.param)
     overrides['openshift_version'] = OPENSHIFT_VERSION
-    baseconfig = Kbaseconfig(client=args.client, debug=args.debug)
+    baseconfig = Kbaseconfig(client=args.client, debug=args.debug, offline=True)
     available_apps = baseconfig.list_apps_openshift(quiet=True)
     for app in apps:
         if app not in available_apps:
             common.pprint("app %s not available. Skipping..." % app, color='red')
             continue
         common.pprint("Adding app %s" % app, color='blue')
-        baseconfig.create_app_openshift(app, overrides)
+        baseconfig.create_app_openshift(app, overrides, outputdir=outputdir)
 
 
 def delete_app_generic(args):
@@ -849,7 +867,7 @@ def delete_app_generic(args):
     elif not os.path.isabs(os.environ['KUBECONFIG']):
         os.environ['KUBECONFIG'] = "%s/%s" % (os.getcwd(), os.environ['KUBECONFIG'])
     overrides = common.get_overrides(paramfile=paramfile, param=args.param)
-    baseconfig = Kbaseconfig(client=args.client, debug=args.debug)
+    baseconfig = Kbaseconfig(client=args.client, debug=args.debug, offline=True)
     available_apps = baseconfig.list_apps_generic(quiet=True)
     for app in apps:
         if app not in available_apps:
@@ -874,7 +892,7 @@ def delete_app_openshift(args):
     OPENSHIFT_VERSION = os.popen('oc version').readlines()[1].split(" ")[2].strip().replace('v', '')[:3]
     overrides = common.get_overrides(paramfile=paramfile, param=args.param)
     overrides['openshift_version'] = OPENSHIFT_VERSION
-    baseconfig = Kbaseconfig(client=args.client, debug=args.debug)
+    baseconfig = Kbaseconfig(client=args.client, debug=args.debug, offline=True)
     available_apps = baseconfig.list_apps_openshift(quiet=True)
     for app in apps:
         if app not in available_apps:
@@ -886,7 +904,7 @@ def delete_app_openshift(args):
 
 def list_apps_generic(args):
     """List generic kube apps"""
-    baseconfig = Kbaseconfig(client=args.client, debug=args.debug)
+    baseconfig = Kbaseconfig(client=args.client, debug=args.debug, offline=True)
     apps = PrettyTable(["Name"])
     for app in baseconfig.list_apps_generic(quiet=True):
         apps.add_row([app])
@@ -895,7 +913,7 @@ def list_apps_generic(args):
 
 def list_apps_openshift(args):
     """List openshift kube apps"""
-    baseconfig = Kbaseconfig(client=args.client, debug=args.debug)
+    baseconfig = Kbaseconfig(client=args.client, debug=args.debug, offline=True)
     apps = PrettyTable(["Name"])
     for app in baseconfig.list_apps_openshift(quiet=True):
         apps.add_row([app])
@@ -2578,6 +2596,7 @@ def cli():
     appgenericcreate_parser = createapp_subparsers.add_parser('generic', description=appgenericcreate_desc,
                                                               help=appgenericcreate_desc,
                                                               epilog=appgenericcreate_epilog, formatter_class=rawhelp)
+    appgenericcreate_parser.add_argument('--outputdir', '-o', help='Output directory', metavar='OUTPUTDIR')
     appgenericcreate_parser.add_argument('-P', '--param', action='append',
                                          help='specify parameter or keyword for rendering (multiple can be specified)',
                                          metavar='PARAM')
@@ -2591,6 +2610,7 @@ def cli():
                                                                 help=appopenshiftcreate_desc,
                                                                 epilog=appopenshiftcreate_epilog,
                                                                 formatter_class=rawhelp)
+    appopenshiftcreate_parser.add_argument('--outputdir', '-o', help='Output directory', metavar='OUTPUTDIR')
     appopenshiftcreate_parser.add_argument('-P', '--param', action='append',
                                            help=PARAMETERS_HELP, metavar='PARAM')
     appopenshiftcreate_parser.add_argument('--paramfile', help='Parameters file', metavar='PARAMFILE')

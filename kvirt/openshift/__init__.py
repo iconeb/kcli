@@ -7,7 +7,7 @@ import json
 import os
 import sys
 from kvirt.common import info, pprint, gen_mac, get_oc, get_values, pwd_path, insecure_fetch, fetch
-from kvirt.common import get_commit_rhcos, get_latest_fcos, kube_create_app, patch_ceo
+from kvirt.common import get_commit_rhcos, get_latest_fcos, kube_create_app, patch_bootstrap
 from kvirt.common import ssh, scp, _ssh_credentials, word2number
 from kvirt.openshift.calico import calicoassets
 import re
@@ -20,7 +20,7 @@ import yaml
 
 virtplatforms = ['kvm', 'kubevirt', 'ovirt', 'openstack', 'vsphere', 'packet']
 cloudplatforms = ['aws', 'gcp']
-DEFAULT_TAG = '4.5'
+DEFAULT_TAG = '4.6'
 
 
 def get_installer_version():
@@ -60,7 +60,7 @@ def get_downstream_installer(nightly=False, macosx=False, tag=None):
     elif str(tag).count('.') == 1:
         repo += '/latest-%s' % tag
     else:
-        repo += '/%s' % tag
+        repo += '/%s' % tag.replace('-x86_64', '')
     INSTALLSYSTEM = 'mac' if os.path.exists('/Users') or macosx else 'linux'
     msg = 'Downloading openshift-install from https://mirror.openshift.com/pub/openshift-v4/clients/%s' % repo
     pprint(msg, color='blue')
@@ -252,14 +252,20 @@ def create(config, plandir, cluster, overrides):
             'apps': [],
             'minimal': False}
     data.update(overrides)
-    data['cluster'] = overrides.get('cluster', cluster if cluster is not None else 'testk')
-    plan = cluster if cluster is not None else data['cluster']
+    if 'cluster' in overrides:
+        clustervalue = overrides.get('cluster')
+    elif cluster is not None:
+        clustervalue = cluster
+    else:
+        clustervalue = 'testk'
+    data['cluster'] = clustervalue
+    pprint("Deploying cluster %s" % clustervalue, color='blue')
+    plan = cluster if cluster is not None else clustervalue
     overrides['kubetype'] = 'openshift'
     apps = overrides.get('apps', [])
     if ('localstorage' in apps or 'ocs' in apps) and 'extra_disks' not in overrides\
             and 'extra_master_disks' not in overrides and 'extra_worker_disks' not in overrides:
         pprint("Storage apps require extra disks to be set", color='yellow')
-    data['cluster'] = overrides.get('cluster', cluster)
     overrides['kube'] = data['cluster']
     installparam = overrides.copy()
     masters = data.get('masters', 1)
@@ -320,6 +326,7 @@ def create(config, plandir, cluster, overrides):
     disconnected_url = data.get('disconnected_url')
     disconnected_user = data.get('disconnected_user')
     disconnected_password = data.get('disconnected_password')
+    disconnected_prefix = data.get('disconnected_prefix', 'ocp4')
     tag = data.get('tag')
     pub_key = data.get('pub_key')
     pull_secret = pwd_path(data.get('pull_secret')) if not upstream else "%s/fake_pull.json" % plandir
@@ -356,11 +363,6 @@ def create(config, plandir, cluster, overrides):
             tag = 'registry.svc.ci.openshift.org/%s/release:%s' % (basetag, tag)
         os.environ['OPENSHIFT_INSTALL_RELEASE_IMAGE_OVERRIDE'] = tag
         pprint("Setting OPENSHIFT_INSTALL_RELEASE_IMAGE_OVERRIDE to %s" % tag, color='blue')
-    if disconnected_url is not None:
-        if '/' not in str(tag):
-            tag = '%s/release:%s' % (disconnected_url, tag)
-            os.environ['OPENSHIFT_INSTALL_RELEASE_IMAGE_OVERRIDE'] = tag
-        pprint("Setting OPENSHIFT_INSTALL_RELEASE_IMAGE_OVERRIDE to %s" % tag, color='blue')
     if find_executable('openshift-install') is None:
         if version == 'ci':
             run = get_ci_installer(pull_secret, tag=tag, upstream=upstream)
@@ -374,6 +376,11 @@ def create(config, plandir, cluster, overrides):
             pprint("Couldn't download openshift-install", color='red')
             os._exit(run)
         pprint("Move downloaded openshift-install somewhere in your path if you want to reuse it", color='blue')
+    if disconnected_url is not None:
+        if '/' not in str(tag):
+            tag = '%s/%s/release:%s' % (disconnected_url, disconnected_prefix, tag)
+            os.environ['OPENSHIFT_INSTALL_RELEASE_IMAGE_OVERRIDE'] = tag
+        pprint("Setting OPENSHIFT_INSTALL_RELEASE_IMAGE_OVERRIDE to %s" % tag, color='blue')
     INSTALLER_VERSION = get_installer_version()
     COMMIT_ID = os.popen('openshift-install version').readlines()[1].replace('built from commit', '').strip()
     if platform == 'packet' and not upstream:
@@ -475,11 +482,13 @@ def create(config, plandir, cluster, overrides):
         for asset in calicoassets:
             fetch(asset, manifestsdir)
     call('openshift-install --dir=%s create ignition-configs' % clusterdir, shell=True)
-    if masters == 1:
+    if masters < 3:
         version_match = re.match("4.([0-9]*).*", INSTALLER_VERSION)
         COS_VERSION = "4%s" % version_match.group(1) if version_match is not None else '45'
         if upstream or int(COS_VERSION) > 43:
-            patch_ceo("%s/bootstrap.ign" % clusterdir)
+            bootstrap_patch = open('%s/bootstrap_patch.sh' % plandir).read()
+            bootstrap_service = open('%s/bootstrap_patch.service' % plandir).read()
+            patch_bootstrap("%s/bootstrap.ign" % clusterdir, bootstrap_patch, bootstrap_service)
     staticdata = gather_dhcp(data, platform)
     domain = data.get('domain')
     if staticdata:
@@ -493,7 +502,6 @@ def create(config, plandir, cluster, overrides):
         if data.get('virtual_router_id') is None:
             overrides['virtual_router_id'] = word2number(cluster)
         pprint("Using keepalived virtual_router_id %s" % overrides['virtual_router_id'], color='blue')
-        host_ip = ingress_ip if platform != "openstack" else public_api_ip
         pprint("Using %s for api vip...." % api_ip, color='blue')
         ignore_hosts = data.get('ignore_hosts', False)
         if ignore_hosts:
@@ -501,27 +509,42 @@ def create(config, plandir, cluster, overrides):
         elif not os.path.exists("/i_am_a_container"):
             hosts = open("/etc/hosts").readlines()
             wronglines = [e for e in hosts if not e.startswith('#') and "api.%s.%s" % (cluster, domain) in e and
-                          host_ip not in e]
+                          api_ip not in e]
+            if ingress_ip is not None:
+                o = "oauth-openshift.apps.%s.%s" % (cluster, domain)
+                wrongingresses = [e for e in hosts if not e.startswith('#') and o in e and ingress_ip not in e]
+                wronglines.extend(wrongingresses)
             for wrong in wronglines:
-                pprint("Cleaning duplicate entries for api.%s.%s in /etc/hosts" % (cluster, domain), color='blue')
-                call("sudo sed -i '/api.%s.%s/d' /etc/hosts" % (cluster, domain), shell=True)
+                pprint("Cleaning wrong entry %s in /etc/hosts" % wrong, color='yellow')
+                call("sudo sed -i '/%s/d' /etc/hosts" % wrong, shell=True)
             hosts = open("/etc/hosts").readlines()
             correct = [e for e in hosts if not e.startswith('#') and "api.%s.%s" % (cluster, domain) in e and
-                       host_ip in e]
+                       api_ip in e]
             if not correct:
-                entries = ["%s.%s.%s" % (x, cluster, domain) for x in ['api', 'console-openshift-console.apps',
-                                                                       'oauth-openshift.apps',
-                                                                       'prometheus-k8s-openshift-monitoring.apps']]
+                entries = ["api.%s.%s" % (cluster, domain)]
+                ingress_entries = ["%s.%s.%s" % (x, cluster, domain) for x in ['console-openshift-console.apps',
+                                   'oauth-openshift.apps', 'prometheus-k8s-openshift-monitoring.apps']]
+                if ingress_ip is None:
+                    entries.extend(ingress_entries)
                 entries = ' '.join(entries)
-                call("sudo sh -c 'echo %s %s >> /etc/hosts'" % (host_ip, entries), shell=True)
+                call("sudo sh -c 'echo %s %s >> /etc/hosts'" % (api_ip, entries), shell=True)
+                if ingress_ip is not None:
+                    entries = ' '.join(ingress_entries)
+                    call("sudo sh -c 'echo %s %s >> /etc/hosts'" % (ingress_ip, entries), shell=True)
         else:
-            entries = ["%s.%s.%s" % (x, cluster, domain) for x in ['api', 'console-openshift-console.apps',
-                                                                   'oauth-openshift.apps',
-                                                                   'prometheus-k8s-openshift-monitoring.apps']]
+            entries = ["api.%s.%s" % (cluster, domain)]
+            ingress_entries = ["%s.%s.%s" % (x, cluster, domain) for x in ['console-openshift-console.apps',
+                                                                           'oauth-openshift.apps',
+                                                                           'prometheus-k8s-openshift-monitoring.apps']]
+            if ingress_ip is None:
+                entries.extend(ingress_entries)
             entries = ' '.join(entries)
-            call("sh -c 'echo %s %s >> /etc/hosts'" % (host_ip, entries), shell=True)
+            call("sh -c 'echo %s %s >> /etc/hosts'" % (api_ip, entries), shell=True)
             if os.path.exists('/etcdir/hosts'):
-                call("sh -c 'echo %s %s >> /etcdir/hosts'" % (host_ip, entries), shell=True)
+                call("sh -c 'echo %s %s >> /etcdir/hosts'" % (api_ip, entries), shell=True)
+                if ingress_ip is not None:
+                    entries = ' '.join(ingress_entries)
+                    call("sudo sh -c 'echo %s %s >> /etcdir/hosts'" % (ingress_ip, entries), shell=True)
         if platform in ['kubevirt', 'openstack', 'vsphere'] or (platform == 'packet' and config.k.tunnelhost is None):
             # bootstrap ignition is too big in those platforms so we deploy a temporary web server to serve it
             helper_overrides = {}
@@ -731,12 +754,6 @@ def create(config, plandir, cluster, overrides):
     call("oc adm taint nodes -l node-role.kubernetes.io/master node-role.kubernetes.io/master:NoSchedule-", shell=True)
     pprint("Deploying certs autoapprover cronjob", color='blue')
     call("oc create -f %s/autoapprovercron.yml" % clusterdir, shell=True)
-    if masters == 1 and int(COS_VERSION) > 45:
-        pprint("Patching authentication for single master", color='yellow')
-        authcommand = "oc patch authentications.operator.openshift.io "
-        authcommand += "cluster -p='{\"spec\": {\"unsupportedConfigOverrides\": "
-        authcommand += "{\"useUnsupportedUnsafeNonHANonProductionUnstableOAuthServer\": true}}}' --type=merge"
-        call(authcommand, shell=True)
     if not minimal:
         installcommand = 'openshift-install --dir=%s wait-for install-complete' % clusterdir
         installcommand += " || %s" % installcommand

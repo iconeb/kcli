@@ -280,34 +280,37 @@ class Kconfig(Kbaseconfig):
         if profile is None:
             return {'result': 'failure', 'reason': "Missing profile"}
         vmprofiles = {k: v for k, v in self.profiles.items() if 'type' not in v or v['type'] == 'vm'}
-        if customprofile:
-            vmprofiles[profile] = customprofile
-            customprofileimage = customprofile.get('image')
-            if customprofileimage is not None:
-                clientprofile = "%s_%s" % (self.client, customprofileimage)
-                if clientprofile in vmprofiles and 'image' in vmprofiles[clientprofile]:
-                    vmprofiles[profile]['image'] = vmprofiles[clientprofile]['image']
-                elif customprofileimage in IMAGES and self.type != 'packet' and\
-                        IMAGES[customprofileimage] not in [os.path.basename(v) for v in self.k.volumes()]:
-                    common.pprint("Image %s not found. Downloading" % customprofileimage, color='blue')
-                    self.handle_host(pool=self.pool, image=customprofileimage, download=True, update_profile=True)
-                    vmprofiles[profile]['image'] = os.path.basename(IMAGES[customprofileimage])
-        else:
-            if not onlyassets:
-                common.pprint("Deploying vm %s from profile %s..." % (name, profile))
-        if profile not in vmprofiles:
-            clientprofile = "%s_%s" % (self.client, profile)
-            if clientprofile in vmprofiles and 'image' in vmprofiles[clientprofile]:
-                vmprofiles[profile] = {'image': vmprofiles[clientprofile]['image']}
-            elif profile in IMAGES and IMAGES[profile] not in [os.path.basename(v) for v in self.k.volumes()]\
-                    and self.type not in ['aws', 'gcp', 'packet']:
-                common.pprint("Image %s not found. Downloading" % profile, color='blue')
-                self.handle_host(pool=self.pool, image=profile, download=True, update_profile=True)
-                vmprofiles[profile] = {'image': os.path.basename(IMAGES[profile])}
+        if not onlyassets:
+            if customprofile:
+                vmprofiles[profile] = customprofile
+                customprofileimage = customprofile.get('image')
+                if customprofileimage is not None:
+                    clientprofile = "%s_%s" % (self.client, customprofileimage)
+                    if clientprofile in vmprofiles and 'image' in vmprofiles[clientprofile]:
+                        vmprofiles[profile]['image'] = vmprofiles[clientprofile]['image']
+                    elif customprofileimage in IMAGES and self.type != 'packet' and\
+                            IMAGES[customprofileimage] not in [os.path.basename(v) for v in self.k.volumes()]:
+                        common.pprint("Image %s not found. Downloading" % customprofileimage, color='blue')
+                        self.handle_host(pool=self.pool, image=customprofileimage, download=True, update_profile=True)
+                        vmprofiles[profile]['image'] = os.path.basename(IMAGES[customprofileimage])
             else:
-                if not onlyassets:
+                common.pprint("Deploying vm %s from profile %s..." % (name, profile))
+            if profile not in vmprofiles:
+                clientprofile = "%s_%s" % (self.client, profile)
+                if clientprofile in vmprofiles and 'image' in vmprofiles[clientprofile]:
+                    vmprofiles[profile] = {'image': vmprofiles[clientprofile]['image']}
+                elif profile in IMAGES and IMAGES[profile] not in [os.path.basename(v) for v in self.k.volumes()]\
+                        and self.type not in ['aws', 'gcp', 'packet']:
+                    common.pprint("Image %s not found. Downloading" % profile, color='blue')
+                    self.handle_host(pool=self.pool, image=profile, download=True, update_profile=True)
+                    vmprofiles[profile] = {'image': os.path.basename(IMAGES[profile])}
+                else:
                     common.pprint("Profile %s not found. Using the image as profile..." % profile, color='blue')
-                vmprofiles[profile] = {'image': profile}
+                    vmprofiles[profile] = {'image': profile}
+        elif customprofile:
+            vmprofiles[profile] = customprofile
+        else:
+            vmprofiles[profile] = {'image': profile}
         profilename = profile
         profile = vmprofiles[profile]
         if not customprofile:
@@ -671,14 +674,14 @@ class Kconfig(Kbaseconfig):
                 if not os.path.exists(notifyscript):
                     notifycmd = None
                     notifyscript = None
-                    common.pprint("Notification required but missing notifyscript", color='yellow')
+                    common.pprint("Notification required for %s but missing notifyscript" % name, color='yellow')
                 else:
                     files.append({'path': '/root/.notify.sh', 'origin': notifyscript})
                     notifycmd = "bash /root/.notify.sh"
             for notifymethod in notifymethods:
                 if notifymethod == 'pushbullet':
                     if pushbullettoken is None:
-                        common.pprint("Notification required but missing pushbullettoken", color='yellow')
+                        common.pprint("Notification required for %s but missing pushbullettoken" % name, color='yellow')
                     elif notifyscript is None and notifycmd is None:
                         continue
                     else:
@@ -694,9 +697,9 @@ class Kconfig(Kbaseconfig):
                             cmds.append(pbcmd)
                 elif notifymethod == 'slack':
                     if slackchannel is None:
-                        common.pprint("Notification required but missing slack channel", color='yellow')
+                        common.pprint("Notification required for %s but missing slack channel" % name, color='yellow')
                     elif slacktoken is None:
-                        common.pprint("Notification required but missing slacktoken", color='yellow')
+                        common.pprint("Notification required for %s but missing slacktoken" % name, color='yellow')
                     else:
                         title = "Vm %s on %s report" % (name, self.client)
                         slackcmd = "info=`%s 2>&1 | sed 's/\\x2/ /g'`;" % notifycmd
@@ -712,11 +715,11 @@ class Kconfig(Kbaseconfig):
                             cmds.append(slackcmd)
                 elif notifymethod == 'mail':
                     if mailserver is None:
-                        common.pprint("Notification required but missing mailserver", color='yellow')
+                        common.pprint("Notification required for %s but missing mailserver" % name, color='yellow')
                     elif mailfrom is None:
-                        common.pprint("Notification required but missing mailfrom", color='yellow')
+                        common.pprint("Notification required for %s but missing mailfrom" % name, color='yellow')
                     elif not mailto:
-                        common.pprint("Notification required but missing mailto", color='yellow')
+                        common.pprint("Notification required for %s but missing mailto" % name, color='yellow')
                     else:
                         title = "Vm %s on %s report" % (name, self.client)
                         now = datetime.now()
@@ -748,7 +751,7 @@ $INFO
                     common.pprint("Invalid method %s" % notifymethod, color='red')
         ips = [overrides[key] for key in overrides if key.startswith('ip')]
         netmasks = [overrides[key] for key in overrides if key.startswith('netmask')]
-        if privatekey:
+        if privatekey and self.type == 'kvm':
             privatekeyfile, publickeyfile = None, None
             for path in ["~/.kcli/id_rsa", "~/.kcli/id_dsa", "~/.ssh/id_rsa", "~/.ssh/id_dsa"]:
                 expanded_path = os.path.expanduser(path)
@@ -759,12 +762,25 @@ $INFO
             if privatekeyfile is not None and publickeyfile is not None:
                 privatekey = open(privatekeyfile).read().strip()
                 publickey = open(publickeyfile).read().strip()
+                common.pprint("Injecting private key for %s" % name, color='yellow')
                 if files:
                     files.append({'path': '/root/.ssh/id_rsa', 'content': privatekey})
                     files.append({'path': '/root/.ssh/id_rsa.pub', 'content': publickey})
                 else:
-                    files = [{'path': '/root/.ssh/id_rsa', 'content': privatekey}]
-                    files = [{'path': '/root/.ssh/id_rsa.pub', 'content': publickey}]
+                    files = [{'path': '/root/.ssh/id_rsa', 'content': privatekey},
+                             {'path': '/root/.ssh/id_rsa.pub', 'content': publickey}]
+                if self.host in ['127.0.0.1', 'localhost']:
+                    authorized_keys_file = os.path.expanduser('~/.ssh/authorized_keys')
+                    found = False
+                    if os.path.exists(authorized_keys_file):
+                        for line in open(authorized_keys_file).readlines():
+                            if publickey in line:
+                                found = True
+                                break
+                        if not found:
+                            common.pprint("Adding public key to authorized_keys_file for %s" % name, color='yellow')
+                            with open(authorized_keys_file, 'a') as f:
+                                f.write(publickey)
         if cmds and 'reboot' in cmds:
             while 'reboot' in cmds:
                 cmds.remove('reboot')
@@ -1516,7 +1532,7 @@ $INFO
                 if customprofile:
                     customprofile.update(profile)
                     profile = customprofile
-                if z.exists(name):
+                if z.exists(name) and not onlyassets:
                     if not update:
                         common.pprint("%s skipped on %s!" % (name, vmclient), color='blue')
                     else:
@@ -1642,7 +1658,8 @@ $INFO
                 result = self.create_vm(name, profilename, overrides=currentoverrides, customprofile=profile, k=z,
                                         plan=plan, basedir=currentplandir, client=vmclient, onfly=onfly,
                                         onlyassets=onlyassets)
-                common.handle_response(result, name, client=vmclient)
+                if not onlyassets:
+                    common.handle_response(result, name, client=vmclient)
                 if result['result'] == 'success':
                     newvms.append(name)
                     start = profile.get('start', True)
@@ -2001,6 +2018,13 @@ $INFO
         while ip is None:
             info = k.info(name)
             user, ip = info.get('user'), info.get('ip')
+            if user is not None and ip is not None:
+                testcmd = common.ssh(name, user=user, ip=ip, tunnel=self.tunnel, tunnelhost=self.tunnelhost,
+                                     tunnelport=self.tunnelport, tunneluser=self.tunneluser, insecure=self.insecure,
+                                     cmd='id -un')
+                if os.popen(testcmd).read().strip() != user:
+                    common.pprint("Gathered ip not functional...", color='yellow')
+                    ip = None
             common.pprint("Waiting for vm to be accessible...", color='blue')
             sleep(5)
         sleep(5)
@@ -2010,7 +2034,7 @@ $INFO
             sshcmd = common.ssh(name, user=user, ip=ip, tunnel=self.tunnel, tunnelhost=self.tunnelhost,
                                 tunnelport=self.tunnelport, tunneluser=self.tunneluser, insecure=self.insecure, cmd=cmd)
             output = os.popen(sshcmd).read()
-            if 'finished' in output:
+            if 'cloud-init' in output.lower() and 'finished' in output:
                 done = True
             output = output.replace(oldoutput, '')
             if not quiet:
